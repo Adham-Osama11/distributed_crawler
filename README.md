@@ -27,5 +27,6 @@ distributed_crawler/ ├── README.md ├── requirements.txt ├── .g
 
 3.**Install dependencies**:
     ```bash
+    
     pip install -r requirements.txt
 

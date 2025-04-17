@@ -10,7 +10,8 @@ It defines three main components:
 - **IndexerNode**: Consumes processed text, builds/merges inverted index, serves search queries.
 
 ## Directory Structure
-distributed_crawler/ ├── README.md ├── requirements.txt ├── .gitignore ├── src/ │ ├── init.py │ ├── master_node.py │ ├── crawler_node.py │ └── indexer_node.py └── tests/ ├── init.py ├── test_master.py ├── test_crawler.py └── test_indexer.py
+distributed_crawler/ ├── README.md ├── requirements.txt ├── .gitignore ├── src/ │ ├── init.py │ ├── master_node.py │ ├── crawler_node.py │ └── indexer_node.py
+                                                                       └── tests/ ├── init.py ├── test_master.py ├── test_crawler.py └── test_indexer.py
 
 
 ## Setup

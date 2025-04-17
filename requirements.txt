@@ -1,0 +1,6 @@
+# requirements.txt
+
+mpi4py
+requests
+beautifulsoup4
+pytest

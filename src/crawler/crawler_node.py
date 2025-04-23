@@ -224,9 +224,6 @@ class CrawlerNode:
         self.settings.update({'LOG_LEVEL': 'ERROR'})  # Only show errors, not info messages
         process = CrawlerProcess(self.settings)
         
-        # Create a spider instance with the correct parameters
-        spider = WebSpider(url=url, task_id=task_id, depth=depth)
-        
         # Define a callback to handle results after the crawl is complete
         def handle_spider_closed(spider):
             # Process the results from the spider
@@ -248,31 +245,16 @@ class CrawlerNode:
                     self._send_result(res, task)
         
         # Connect the spider_closed signal to our handler
-        process.crawl(spider)
         process.signals.connect(handle_spider_closed, signal=signals.spider_closed)
+        
+        # Crawl with the spider class, not an instance
+        process.crawl(WebSpider, url=url, task_id=task_id, depth=depth)
         
         # Run the spider
         process.start()
         
-        # Get the results from the spider after it's done
-        for result in process.spider_loader.list():
-            spider_instance = process.spider_loader.load(result)
-            if hasattr(spider_instance, 'results') and spider_instance.results:
-                for res in spider_instance.results:
-                    # Print only the parsed content
-                    print("\n--- PARSED CONTENT ---")
-                    print(f"URL: {res['url']}")
-                    content = res['content']
-                    print(f"Title: {content.get('title', ['No title'])[0] if isinstance(content.get('title'), list) else content.get('title', 'No title')}")
-                    print(f"Description: {content.get('description', ['No description'])[0] if isinstance(content.get('description'), list) else content.get('description', 'No description')}")
-                    print(f"Keywords: {content.get('keywords', ['No keywords'])[0] if isinstance(content.get('keywords'), list) else content.get('keywords', 'No keywords')}")
-                    print(f"Language: {content.get('language', ['Not specified'])[0] if isinstance(content.get('language'), list) else content.get('language', 'Not specified')}")
-                    print(f"Content Type: {content.get('content_type', 'Unknown')}")
-                    print(f"Discovered URLs: {len(res['discovered_urls'])}")
-                    print("--------------------\n")
-                    
-                    # Send the result to the master
-                    self._send_result(res, task)
+        # Remove the code that tries to access process.spider_loader after process.start()
+        # This part was causing issues because spider_loader might not be accessible after the process completes
     
     def _send_result(self, result, original_task):
         """Send crawl results back to the master node."""

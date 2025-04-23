@@ -48,7 +48,7 @@ class WebSpider(scrapy.Spider):
         self.depth = depth
         self.results = []
     
-   def parse(self, response):
+    def parse(self, response):
         """Parse the response and extract content and links."""
         # Use ItemLoader for better data extraction
         # Pass the response object as the selector

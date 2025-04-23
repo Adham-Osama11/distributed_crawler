@@ -11,6 +11,7 @@ from scrapy.crawler import CrawlerProcess
 from scrapy.utils.project import get_project_settings
 from scrapy.loader import ItemLoader
 from scrapy.item import Item, Field
+from scrapy import signals
 from datetime import datetime, timezone
 import sys
 import os
@@ -226,8 +227,29 @@ class CrawlerNode:
         # Create a spider instance with the correct parameters
         spider = WebSpider(url=url, task_id=task_id, depth=depth)
         
-        # Add the spider to the process
-        process.crawl(WebSpider, url=url, task_id=task_id, depth=depth)
+        # Define a callback to handle results after the crawl is complete
+        def handle_spider_closed(spider):
+            # Process the results from the spider
+            if hasattr(spider, 'results') and spider.results:
+                for res in spider.results:
+                    # Print only the parsed content
+                    print("\n--- PARSED CONTENT ---")
+                    print(f"URL: {res['url']}")
+                    content = res['content']
+                    print(f"Title: {content.get('title', ['No title'])[0] if isinstance(content.get('title'), list) else content.get('title', 'No title')}")
+                    print(f"Description: {content.get('description', ['No description'])[0] if isinstance(content.get('description'), list) else content.get('description', 'No description')}")
+                    print(f"Keywords: {content.get('keywords', ['No keywords'])[0] if isinstance(content.get('keywords'), list) else content.get('keywords', 'No keywords')}")
+                    print(f"Language: {content.get('language', ['Not specified'])[0] if isinstance(content.get('language'), list) else content.get('language', 'Not specified')}")
+                    print(f"Content Type: {content.get('content_type', 'Unknown')}")
+                    print(f"Discovered URLs: {len(res['discovered_urls'])}")
+                    print("--------------------\n")
+                    
+                    # Send the result to the master
+                    self._send_result(res, task)
+        
+        # Connect the spider_closed signal to our handler
+        process.crawl(spider)
+        process.signals.connect(handle_spider_closed, signal=signals.spider_closed)
         
         # Run the spider
         process.start()

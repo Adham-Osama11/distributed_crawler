@@ -108,7 +108,8 @@ class CrawlerNode:
             'ROBOTSTXT_OBEY': True,
             'DOWNLOAD_DELAY': 1.0,  # Basic politeness - 1 second delay
             'CONCURRENT_REQUESTS': 1,  # Start with just 1 concurrent request
-            'LOG_LEVEL': 'INFO'
+            'LOG_LEVEL': 'ERROR',  # Only show errors, not info messages
+            'LOG_ENABLED': False,  # Disable logging completely if you want no output
         })
         
         # Flag to control the crawler
@@ -218,23 +219,38 @@ class CrawlerNode:
         
         print(f"Processing URL: {url} (depth: {depth}/{max_depth})")
         
-        # Create a new CrawlerProcess for each task
+        # Create a new CrawlerProcess for each task with reduced logging
+        self.settings.update({'LOG_LEVEL': 'ERROR'})  # Only show errors, not info messages
         process = CrawlerProcess(self.settings)
-        
-        # Define a callback to handle results after the crawl is complete
-        def handle_spider_closed(spider):
-            # Send results back to the master
-            for result in spider.results:
-                self._send_result(result, task)
         
         # Create a spider instance with the correct parameters
         spider = WebSpider(url=url, task_id=task_id, depth=depth)
         
-        # Add a callback for when the spider closes
+        # Add the spider to the process
         process.crawl(WebSpider, url=url, task_id=task_id, depth=depth)
         
         # Run the spider
         process.start()
+        
+        # Get the results from the spider after it's done
+        for result in process.spider_loader.list():
+            spider_instance = process.spider_loader.load(result)
+            if hasattr(spider_instance, 'results') and spider_instance.results:
+                for res in spider_instance.results:
+                    # Print only the parsed content
+                    print("\n--- PARSED CONTENT ---")
+                    print(f"URL: {res['url']}")
+                    content = res['content']
+                    print(f"Title: {content.get('title', ['No title'])[0] if isinstance(content.get('title'), list) else content.get('title', 'No title')}")
+                    print(f"Description: {content.get('description', ['No description'])[0] if isinstance(content.get('description'), list) else content.get('description', 'No description')}")
+                    print(f"Keywords: {content.get('keywords', ['No keywords'])[0] if isinstance(content.get('keywords'), list) else content.get('keywords', 'No keywords')}")
+                    print(f"Language: {content.get('language', ['Not specified'])[0] if isinstance(content.get('language'), list) else content.get('language', 'Not specified')}")
+                    print(f"Content Type: {content.get('content_type', 'Unknown')}")
+                    print(f"Discovered URLs: {len(res['discovered_urls'])}")
+                    print("--------------------\n")
+                    
+                    # Send the result to the master
+                    self._send_result(res, task)
     
     def _send_result(self, result, original_task):
         """Send crawl results back to the master node."""

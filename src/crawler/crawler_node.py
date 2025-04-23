@@ -9,6 +9,9 @@ import boto3
 import scrapy
 from scrapy.crawler import CrawlerProcess
 from scrapy.utils.project import get_project_settings
+from scrapy.loader import ItemLoader
+from scrapy.item import Item, Field
+from datetime import datetime, timezone
 import sys
 import os
 import threading
@@ -20,6 +23,19 @@ from common.config import (
     HEARTBEAT_INTERVAL
 )
 from common.utils import get_domain, normalize_url
+
+class WebPage(Item):
+    """Scrapy Item for storing web page data."""
+    url = Field()
+    title = Field()
+    description = Field()
+    keywords = Field()
+    text = Field()
+    links = Field()
+    timestamp = Field()
+    content_type = Field()
+    language = Field()
+    html = Field()
 
 class WebSpider(scrapy.Spider):
     """Scrapy spider for crawling web pages."""
@@ -34,15 +50,25 @@ class WebSpider(scrapy.Spider):
     
     def parse(self, response):
         """Parse the response and extract content and links."""
-        # Extract page content
-        content = {
-            'url': response.url,
-            'title': response.css('title::text').get(),
-            'text': ' '.join(response.css('body ::text').getall()),
-            'html': response.text
-        }
+        # Use ItemLoader for better data extraction
+        loader = ItemLoader(item=WebPage())
         
-        # Extract links
+        # Extract metadata
+        loader.add_value('url', response.url)
+        loader.add_xpath('title', '//title/text()')
+        loader.add_xpath('description', "//meta[@name='description']/@content")
+        loader.add_xpath('keywords', "//meta[@name='keywords']/@content")
+        loader.add_xpath('text', '//body//text()')
+        loader.add_css('links', 'a::attr(href)')
+        loader.add_value('timestamp', datetime.now(timezone.utc).isoformat())
+        loader.add_value('content_type', response.headers.get('Content-Type', b'').decode('utf-8', errors='ignore'))
+        loader.add_xpath('language', '//html/@lang')
+        loader.add_value('html', response.text)
+        
+        # Load the item
+        item = loader.load_item()
+        
+        # Extract links for further crawling
         discovered_urls = []
         for href in response.css('a::attr(href)').getall():
             discovered_url = response.urljoin(href)
@@ -52,7 +78,7 @@ class WebSpider(scrapy.Spider):
         self.results.append({
             'task_id': self.task_id,
             'url': response.url,
-            'content': content,
+            'content': dict(item),
             'discovered_urls': discovered_urls,
             'depth': self.depth
         })

@@ -51,39 +51,44 @@ class WebSpider(scrapy.Spider):
     
     def parse(self, response):
         """Parse the response and extract content and links."""
-        # Use ItemLoader for better data extraction
-        # Pass the response object as the selector
-        loader = ItemLoader(item=WebPage(), selector=response)
-        
-        # Extract metadata
-        loader.add_value('url', response.url)
-        loader.add_xpath('title', '//title/text()')
-        loader.add_xpath('description', "//meta[@name='description']/@content")
-        loader.add_xpath('keywords', "//meta[@name='keywords']/@content")
-        loader.add_xpath('text', '//body//text()')
-        loader.add_css('links', 'a::attr(href)')
-        loader.add_value('timestamp', datetime.now(timezone.utc).isoformat())
-        loader.add_value('content_type', response.headers.get('Content-Type', b'').decode('utf-8', errors='ignore'))
-        loader.add_xpath('language', '//html/@lang')
-        loader.add_value('html', response.text)
-        
-        # Load the item
-        item = loader.load_item()
-        
-        # Extract links for further crawling
-        discovered_urls = []
-        for href in response.css('a::attr(href)').getall():
-            discovered_url = response.urljoin(href)
-            discovered_urls.append(normalize_url(discovered_url))
-        
-        # Store the result
-        self.results.append({
-            'task_id': self.task_id,
-            'url': response.url,
-            'content': dict(item),
-            'discovered_urls': discovered_urls,
-            'depth': self.depth
-        })
+        try:
+            # Use ItemLoader for better data extraction
+            # Pass the response object as the selector
+            loader = ItemLoader(item=WebPage(), selector=response)
+            
+            # Extract metadata
+            loader.add_value('url', response.url)
+            loader.add_xpath('title', '//title/text()')
+            loader.add_xpath('description', "//meta[@name='description']/@content")
+            loader.add_xpath('keywords', "//meta[@name='keywords']/@content")
+            loader.add_xpath('text', '//body//text()')
+            loader.add_css('links', 'a::attr(href)')
+            loader.add_value('timestamp', datetime.now(timezone.utc).isoformat())
+            loader.add_value('content_type', response.headers.get('Content-Type', b'').decode('utf-8', errors='ignore'))
+            loader.add_xpath('language', '//html/@lang')
+            loader.add_value('html', response.text)
+            
+            # Load the item
+            item = loader.load_item()
+            
+            # Extract links for further crawling
+            discovered_urls = []
+            for href in response.css('a::attr(href)').getall():
+                discovered_url = response.urljoin(href)
+                discovered_urls.append(normalize_url(discovered_url))
+            
+            # Store the result
+            self.results.append({
+                'task_id': self.task_id,
+                'url': response.url,
+                'content': dict(item),
+                'discovered_urls': discovered_urls,
+                'depth': self.depth
+            })
+        except Exception as e:
+            print(f"Error parsing {response.url}: {e}")
+            import traceback
+            print(traceback.format_exc())
 
 
 class CrawlerNode:
@@ -145,6 +150,8 @@ class CrawlerNode:
                     time.sleep(1)
             except Exception as e:
                 print(f"Error in crawler main loop: {e}")
+                import traceback
+                print(traceback.format_exc())  # Print the full stack trace
                 time.sleep(1)
     
     def stop(self):

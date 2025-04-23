@@ -51,6 +51,11 @@ class SimpleIndex:
         if not text:
             return []
         
+        # Handle case where text is a list (from crawler output)
+        if isinstance(text, list):
+            # Join all text elements with spaces
+            text = ' '.join([str(item) for item in text])
+        
         # Split on whitespace, lowercase, and filter out empty strings
         return [word.lower() for word in text.split() if word.strip()]
     

@@ -64,9 +64,8 @@ class CrawlerNode:
     """
     def __init__(self, crawler_id=None):
         self.crawler_id = crawler_id or f"crawler-{uuid.uuid4()}"
-    # Specify the region when creating the client
+        # Specify the region when creating the client
         self.sqs = boto3.client('sqs', region_name='us-east-1')  # Use the region from your config
-    
         
         # Get queue URLs
         response = self.sqs.get_queue_url(QueueName=CRAWL_TASK_QUEUE)
@@ -192,19 +191,23 @@ class CrawlerNode:
         
         print(f"Processing URL: {url} (depth: {depth}/{max_depth})")
         
-        # Create a Scrapy process
+        # Create a new CrawlerProcess for each task
         process = CrawlerProcess(self.settings)
         
-        # Create a spider instance
+        # Define a callback to handle results after the crawl is complete
+        def handle_spider_closed(spider):
+            # Send results back to the master
+            for result in spider.results:
+                self._send_result(result, task)
+        
+        # Create a spider instance with the correct parameters
         spider = WebSpider(url=url, task_id=task_id, depth=depth)
         
-        # Run the spider
-        process.crawl(spider)
-        process.start()  # This blocks until the crawl is finished
+        # Add a callback for when the spider closes
+        process.crawl(WebSpider, url=url, task_id=task_id, depth=depth)
         
-        # Send results back to the master
-        for result in spider.results:
-            self._send_result(result, task)
+        # Run the spider
+        process.start()
     
     def _send_result(self, result, original_task):
         """Send crawl results back to the master node."""

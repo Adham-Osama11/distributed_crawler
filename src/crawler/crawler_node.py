@@ -293,10 +293,67 @@ class CrawlerNode:
         result['max_depth'] = original_task.get('max_depth', 3)
         result['max_urls_per_domain'] = original_task.get('max_urls_per_domain', 100)
         
+        # Create a copy of the result to modify for sending
+        result_to_send = result.copy()
+        
+        # Remove the full HTML content which is likely causing the size issue
+        if 'content' in result_to_send and 'html' in result_to_send['content']:
+            # Either remove HTML completely
+            del result_to_send['content']['html']
+            
+            # Or truncate it to a reasonable size if you need some of it
+            # result_to_send['content']['html'] = result_to_send['content']['html'][:10000] + '...[truncated]'
+        
+        # Truncate text content if it's too large
+        if 'content' in result_to_send and 'text' in result_to_send['content']:
+            text_content = result_to_send['content']['text']
+            if isinstance(text_content, list) and len(text_content) > 100:
+                # Keep only the first 100 text elements
+                result_to_send['content']['text'] = text_content[:100]
+                result_to_send['content']['text_truncated'] = True
+        
+        # Limit the number of discovered URLs if there are too many
+        if 'discovered_urls' in result_to_send and len(result_to_send['discovered_urls']) > 100:
+            result_to_send['discovered_urls'] = result_to_send['discovered_urls'][:100]
+            result_to_send['discovered_urls_truncated'] = True
+        
         try:
+            # Convert to JSON and check size
+            message_body = json.dumps(result_to_send)
+            message_size = len(message_body.encode('utf-8'))
+            
+            # If still too large, take more drastic measures
+            if message_size > 250000:  # Leave some margin below the 262144 limit
+                print(f"Warning: Message size ({message_size} bytes) is still large. Taking additional measures.")
+                
+                # Keep only essential data
+                minimal_result = {
+                    'crawler_id': result_to_send['crawler_id'],
+                    'task_id': result_to_send['task_id'],
+                    'url': result_to_send['url'],
+                    'depth': result_to_send['depth'],
+                    'max_depth': result_to_send['max_depth'],
+                    'max_urls_per_domain': result_to_send['max_urls_per_domain'],
+                    'content': {
+                        'url': result_to_send['content'].get('url'),
+                        'title': result_to_send['content'].get('title'),
+                        'description': result_to_send['content'].get('description'),
+                    }
+                }
+                
+                # Include a subset of discovered URLs
+                if 'discovered_urls' in result_to_send:
+                    minimal_result['discovered_urls'] = result_to_send['discovered_urls'][:20]
+                    minimal_result['discovered_urls_truncated'] = True
+                
+                # Use the minimal result instead
+                message_body = json.dumps(minimal_result)
+                print(f"Reduced message size from {message_size} to {len(message_body.encode('utf-8'))} bytes")
+            
+            # Send the message
             self.sqs.send_message(
                 QueueUrl=self.crawl_result_queue_url,
-                MessageBody=json.dumps(result)
+                MessageBody=message_body
             )
             print(f"Sent result for URL: {result['url']}")
         except Exception as e:

@@ -227,43 +227,64 @@ class CrawlerNode:
         
         print(f"Processing URL: {url} (depth: {depth}/{max_depth})")
         
-        # Create a new CrawlerProcess for each task with reduced logging
-        self.settings.update({'LOG_LEVEL': 'ERROR'})  # Only show errors, not info messages
-        process = CrawlerProcess(self.settings)
+        # Create a temporary directory for this crawl
+        import tempfile
+        temp_dir = tempfile.mkdtemp()
         
-        # Define a callback to handle results after the crawl is complete
-        def handle_spider_closed(spider):
-            # Process the results from the spider
-            if hasattr(spider, 'results') and spider.results:
-                for res in spider.results:
-                    # Print only the parsed content
-                    print("\n--- PARSED CONTENT ---")
-                    print(f"URL: {res['url']}")
-                    content = res['content']
-                    print(f"Title: {content.get('title', ['No title'])[0] if isinstance(content.get('title'), list) else content.get('title', 'No title')}")
-                    print(f"Description: {content.get('description', ['No description'])[0] if isinstance(content.get('description'), list) else content.get('description', 'No description')}")
-                    print(f"Keywords: {content.get('keywords', ['No keywords'])[0] if isinstance(content.get('keywords'), list) else content.get('keywords', 'No keywords')}")
-                    print(f"Language: {content.get('language', ['Not specified'])[0] if isinstance(content.get('language'), list) else content.get('language', 'Not specified')}")
-                    print(f"Content Type: {content.get('content_type', 'Unknown')}")
-                    print(f"Discovered URLs: {len(res['discovered_urls'])}")
-                    print("--------------------\n")
-                    
-                    # Send the result to the master
-                    self._send_result(res, task)
-        
-        # Connect the spider_closed signal to our handler using the signals module
-        from scrapy import signals
-        crawler = process.create_crawler(WebSpider)
-        crawler.signals.connect(handle_spider_closed, signal=signals.spider_closed)
-        
-        # Crawl with the crawler we created
-        process.crawl(crawler, url=url, task_id=task_id, depth=depth)
-        
-        # Run the spider
-        process.start()
-        
-        # Remove the code that tries to access process.spider_loader after process.start()
-        # This part was causing issues because spider_loader might not be accessible after the process completes
+        try:
+            # Use CrawlerRunner instead of CrawlerProcess
+            from scrapy.crawler import CrawlerRunner
+            from twisted.internet import reactor
+            import crochet
+            
+            # Initialize crochet
+            crochet.setup()
+            
+            # Create a new CrawlerRunner for each task with reduced logging
+            self.settings.update({'LOG_LEVEL': 'ERROR'})  # Only show errors, not info messages
+            runner = CrawlerRunner(self.settings)
+            
+            # Define a callback to handle results after the crawl is complete
+            def handle_spider_closed(spider):
+                # Process the results from the spider
+                if hasattr(spider, 'results') and spider.results:
+                    for res in spider.results:
+                        # Print only the parsed content
+                        print("\n--- PARSED CONTENT ---")
+                        print(f"URL: {res['url']}")
+                        content = res['content']
+                        print(f"Title: {content.get('title', ['No title'])[0] if isinstance(content.get('title'), list) else content.get('title', 'No title')}")
+                        print(f"Description: {content.get('description', ['No description'])[0] if isinstance(content.get('description'), list) else content.get('description', 'No description')}")
+                        print(f"Keywords: {content.get('keywords', ['No keywords'])[0] if isinstance(content.get('keywords'), list) else content.get('keywords', 'No keywords')}")
+                        print(f"Language: {content.get('language', ['Not specified'])[0] if isinstance(content.get('language'), list) else content.get('language', 'Not specified')}")
+                        print(f"Content Type: {content.get('content_type', 'Unknown')}")
+                        print(f"Discovered URLs: {len(res['discovered_urls'])}")
+                        print("--------------------\n")
+                        
+                        # Send the result to the master
+                        self._send_result(res, task)
+            
+            # Use crochet to run the crawl in a controlled way
+            @crochet.wait_for(timeout=180)
+            def run_spider():
+                crawler = runner.create_crawler(WebSpider)
+                crawler.signals.connect(handle_spider_closed, signal=signals.spider_closed)
+                return runner.crawl(crawler, url=url, task_id=task_id, depth=depth)
+            
+            # Run the spider with crochet
+            run_spider()
+            
+        except Exception as e:
+            print(f"Error processing task: {e}")
+            import traceback
+            print(traceback.format_exc())
+        finally:
+            # Clean up the temporary directory
+            import shutil
+            try:
+                shutil.rmtree(temp_dir)
+            except:
+                pass
     
     def _send_result(self, result, original_task):
         """Send crawl results back to the master node."""

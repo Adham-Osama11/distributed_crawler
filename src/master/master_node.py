@@ -46,18 +46,9 @@ class MasterNode:
         self.heartbeat_thread.start()
     
     def _create_queues(self):
-        """Create SQS queues if they don't exist."""
+        """Get URLs for existing SQS queues."""
         try:
-            # Create crawl task queue
-            self.sqs.create_queue(QueueName=CRAWL_TASK_QUEUE)
-            
-            # Create crawl result queue
-            self.sqs.create_queue(QueueName=CRAWL_RESULT_QUEUE)
-            
-            # Create index task queue
-            self.sqs.create_queue(QueueName=INDEX_TASK_QUEUE)
-            
-            # Get queue URLs
+            # Get queue URLs for existing queues
             response = self.sqs.get_queue_url(QueueName=CRAWL_TASK_QUEUE)
             self.crawl_task_queue_url = response['QueueUrl']
             
@@ -67,9 +58,9 @@ class MasterNode:
             response = self.sqs.get_queue_url(QueueName=INDEX_TASK_QUEUE)
             self.index_task_queue_url = response['QueueUrl']
             
-            print("SQS queues created successfully")
+            print("Successfully connected to existing SQS queues")
         except Exception as e:
-            print(f"Error creating SQS queues: {e}")
+            print(f"Error getting SQS queue URLs: {e}")
             raise
     
     def start_crawl(self, seed_urls, max_depth=3, max_urls_per_domain=100):

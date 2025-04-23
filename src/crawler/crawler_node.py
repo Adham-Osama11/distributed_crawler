@@ -48,10 +48,11 @@ class WebSpider(scrapy.Spider):
         self.depth = depth
         self.results = []
     
-    def parse(self, response):
+   def parse(self, response):
         """Parse the response and extract content and links."""
         # Use ItemLoader for better data extraction
-        loader = ItemLoader(item=WebPage())
+        # Pass the response object as the selector
+        loader = ItemLoader(item=WebPage(), selector=response)
         
         # Extract metadata
         loader.add_value('url', response.url)

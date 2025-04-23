@@ -244,11 +244,13 @@ class CrawlerNode:
                     # Send the result to the master
                     self._send_result(res, task)
         
-        # Connect the spider_closed signal to our handler
-        process.signals.connect(handle_spider_closed, signal=signals.spider_closed)
+        # Connect the spider_closed signal to our handler using the signals module
+        from scrapy import signals
+        crawler = process.create_crawler(WebSpider)
+        crawler.signals.connect(handle_spider_closed, signal=signals.spider_closed)
         
-        # Crawl with the spider class, not an instance
-        process.crawl(WebSpider, url=url, task_id=task_id, depth=depth)
+        # Crawl with the crawler we created
+        process.crawl(crawler, url=url, task_id=task_id, depth=depth)
         
         # Run the spider
         process.start()

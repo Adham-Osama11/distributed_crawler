@@ -64,7 +64,9 @@ class CrawlerNode:
     """
     def __init__(self, crawler_id=None):
         self.crawler_id = crawler_id or f"crawler-{uuid.uuid4()}"
-        self.sqs = boto3.client('sqs')
+    # Specify the region when creating the client
+        self.sqs = boto3.client('sqs', region_name='us-east-1')  # Use the region from your config
+    
         
         # Get queue URLs
         response = self.sqs.get_queue_url(QueueName=CRAWL_TASK_QUEUE)

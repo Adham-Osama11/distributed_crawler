@@ -1,6 +1,2 @@
-# requirements.txt
-
-mpi4py
-requests
-beautifulsoup4
-pytest
+boto3==1.28.0
+scrapy==2.8.0

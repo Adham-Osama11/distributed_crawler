@@ -249,21 +249,61 @@ class CrawlerNode:
                 # Process the results from the spider
                 if hasattr(spider, 'results') and spider.results:
                     for res in spider.results:
-                        # Print only the parsed content
+                        # Print more detailed parsed content
                         print("\n--- PARSED CONTENT ---")
                         print(f"URL: {res['url']}")
                         content = res['content']
-                        print(f"Title: {content.get('title', ['No title'])[0] if isinstance(content.get('title'), list) else content.get('title', 'No title')}")
-                        print(f"Description: {content.get('description', ['No description'])[0] if isinstance(content.get('description'), list) else content.get('description', 'No description')}")
-                        print(f"Keywords: {content.get('keywords', ['No keywords'])[0] if isinstance(content.get('keywords'), list) else content.get('keywords', 'No keywords')}")
-                        print(f"Language: {content.get('language', ['Not specified'])[0] if isinstance(content.get('language'), list) else content.get('language', 'Not specified')}")
+                        
+                        # Display title
+                        title = content.get('title', ['No title'])[0] if isinstance(content.get('title'), list) else content.get('title', 'No title')
+                        print(f"Title: {title}")
+                        
+                        # Display description
+                        description = content.get('description', ['No description'])[0] if isinstance(content.get('description'), list) else content.get('description', 'No description')
+                        print(f"Description: {description}")
+                        
+                        # Display keywords
+                        keywords = content.get('keywords', ['No keywords'])[0] if isinstance(content.get('keywords'), list) else content.get('keywords', 'No keywords')
+                        print(f"Keywords: {keywords}")
+                        
+                        # Display language
+                        language = content.get('language', ['Not specified'])[0] if isinstance(content.get('language'), list) else content.get('language', 'Not specified')
+                        print(f"Language: {language}")
+                        
+                        # Display content type
                         print(f"Content Type: {content.get('content_type', 'Unknown')}")
+                        
+                        # Display timestamp
+                        print(f"Timestamp: {content.get('timestamp', 'Unknown')}")
+                        
+                        # Display number of discovered URLs
                         print(f"Discovered URLs: {len(res['discovered_urls'])}")
+                        
+                        # Display a sample of discovered URLs (first 5)
+                        if res['discovered_urls']:
+                            print("\nSample of Discovered URLs:")
+                            for i, url in enumerate(res['discovered_urls'][:5]):
+                                print(f"  {i+1}. {url}")
+                        
+                        # Display extracted text (first 500 characters)
+                        if 'text' in content:
+                            text_content = content['text']
+                            if isinstance(text_content, list):
+                                # Join the list elements with spaces
+                                joined_text = ' '.join([str(item).strip() for item in text_content if str(item).strip()])
+                                # Display first 500 characters
+                                display_text = joined_text[:500] + '...' if len(joined_text) > 500 else joined_text
+                            else:
+                                display_text = text_content[:500] + '...' if len(text_content) > 500 else text_content
+                            
+                            print("\nExtracted Text (preview):")
+                            print(display_text)
+                        
                         print("--------------------\n")
                         
                         # Send the result to the master
                         self._send_result(res, task)
-            
+
             # Use crochet to run the crawl in a controlled way
             @crochet.wait_for(timeout=180)
             def run_spider():

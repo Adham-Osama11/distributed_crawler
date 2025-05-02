@@ -71,6 +71,29 @@ class WebSpider(scrapy.Spider):
             # Load the item
             item = loader.load_item()
             
+            # Clean up extracted fields
+            if 'title' in item and isinstance(item['title'], list):
+              item['title'] = ' '.join([t.strip() for t in item['title'] if t])
+
+            if 'description' in item and isinstance(item['description'], list):
+                item['description'] = ' '.join([d.strip() for d in item['description'] if d])
+            elif 'description' not in item:
+                 item['description'] = ''
+
+            if 'keywords' not in item or not item['keywords']:
+                item['keywords'] = ''
+            elif isinstance(item['keywords'], list):
+                item['keywords'] = ' '.join(item['keywords'])
+
+            if 'content_type' in item and isinstance(item['content_type'], list):
+               item['content_type'] = item['content_type'][0]
+
+            if 'language' in item and isinstance(item['language'], list):
+                item['language'] = item['language'][0]
+            
+            if 'text' in item and isinstance(item['text'], list):
+                item['text'] = [t.strip() for t in item['text'] if t.strip()]
+
             # Extract links for further crawling
             discovered_urls = []
             for href in response.css('a::attr(href)').getall():
@@ -100,6 +123,10 @@ class CrawlerNode:
         # Specify the region when creating the client
         self.sqs = boto3.client('sqs', region_name='us-east-1')  # Use the region from your config
         
+        # Initialize S3 and DynamoDB clients
+        self.s3 = boto3.client('s3', region_name='us-east-1')
+        self.dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+        
         # Get queue URLs
         response = self.sqs.get_queue_url(QueueName=CRAWL_TASK_QUEUE)
         self.crawl_task_queue_url = response['QueueUrl']
@@ -121,9 +148,61 @@ class CrawlerNode:
         # Flag to control the crawler
         self.running = False
         
+        # Ensure DynamoDB tables exist
+        self._ensure_dynamodb_tables()
+        
         # Start heartbeat thread
         self.heartbeat_thread = threading.Thread(target=self._send_heartbeats)
         self.heartbeat_thread.daemon = True
+    
+    def _ensure_dynamodb_tables(self):
+        """Ensure required DynamoDB tables exist."""
+        try:
+            # Define tables to create if they don't exist
+            tables_to_create = {
+                'url-frontier': {
+                    'KeySchema': [
+                        {'AttributeName': 'url', 'KeyType': 'HASH'},
+                        {'AttributeName': 'job_id', 'KeyType': 'RANGE'}  # Add job_id as a sort key
+                    ],
+                    'AttributeDefinitions': [
+                        {'AttributeName': 'url', 'AttributeType': 'S'},
+                        {'AttributeName': 'job_id', 'AttributeType': 'S'}  # Define job_id attribute
+                    ]
+                },
+                'crawl-metadata': {
+                    'KeySchema': [
+                        {'AttributeName': 'url', 'KeyType': 'HASH'}
+                    ],
+                    'AttributeDefinitions': [
+                        {'AttributeName': 'url', 'AttributeType': 'S'}
+                    ]
+                }
+            }
+            
+            # Check if tables exist and create them if they don't
+            existing_tables = [table.name for table in self.dynamodb.tables.all()]
+            
+            for table_name, schema in tables_to_create.items():
+                if table_name not in existing_tables:
+                    try:
+                        print(f"Creating DynamoDB table: {table_name}")
+                        table = self.dynamodb.create_table(
+                            TableName=table_name,
+                            KeySchema=schema['KeySchema'],
+                            AttributeDefinitions=schema['AttributeDefinitions'],
+                            ProvisionedThroughput={
+                                'ReadCapacityUnits': 5,
+                                'WriteCapacityUnits': 5
+                            }
+                        )
+                        # Wait for the table to be created
+                        table.meta.client.get_waiter('table_exists').wait(TableName=table_name)
+                        print(f"Table {table_name} created successfully")
+                    except Exception as e:
+                        print(f"Error creating DynamoDB table {table_name}: {e}")
+        except Exception as e:
+            print(f"Error ensuring DynamoDB tables: {e}")
     
     def start(self):
         """Start the crawler node."""
@@ -192,7 +271,7 @@ class CrawlerNode:
             print(f"Error sending heartbeat: {e}")
     
     def _get_task(self):
-        """Get a task from the crawl task queue."""
+        """Get a task from the crawl task queue and update URL frontier."""
         try:
             response = self.sqs.receive_message(
                 QueueUrl=self.crawl_task_queue_url,
@@ -210,6 +289,56 @@ class CrawlerNode:
                     ReceiptHandle=message['ReceiptHandle']
                 )
                 
+                # Update URL frontier in DynamoDB
+                try:
+                    # First check if the table exists
+                    try:
+                        frontier_table = self.dynamodb.Table('url-frontier')
+                        
+                        # Ensure job_id is present in the task
+                        job_id = task.get('job_id')
+                        if not job_id:
+                            job_id = f"job-{uuid.uuid4()}"
+                            task['job_id'] = job_id
+                        
+                        # Try to update the URL status
+                        frontier_table.update_item(
+                            Key={
+                                'url': task['url'],
+                                'job_id': job_id
+                            },
+                            UpdateExpression="SET #status = :status, last_crawled = :timestamp",
+                            ExpressionAttributeNames={
+                                '#status': 'status'
+                            },
+                            ExpressionAttributeValues={
+                                ':status': 'in_progress',
+                                ':timestamp': datetime.now(timezone.utc).isoformat()
+                            }
+                        )
+                    except Exception as e:
+                        # If update fails, try to put the item instead
+                        if "ValidationException" in str(e):
+                            print(f"Trying to put item instead of update for URL: {task['url']}")
+                            # Ensure there's always a job_id
+                            job_id = task.get('job_id')
+                            if not job_id:
+                                job_id = f"job-{uuid.uuid4()}"
+                                task['job_id'] = job_id
+                    
+                    frontier_table.put_item(
+                        Item={
+                            'url': task['url'],
+                            'job_id': job_id,
+                            'status': 'in_progress',
+                            'last_crawled': datetime.now(timezone.utc).isoformat(),
+                            'depth': task.get('depth', 0),
+                            'crawler_id': self.crawler_id
+                        }
+                    )
+                except Exception as e:
+                    print(f"Error updating URL frontier: {e}")
+                
                 print(f"Received task: {task['url']}")
                 return task
             
@@ -221,7 +350,8 @@ class CrawlerNode:
     def _process_task(self, task):
         """Process a crawl task using Scrapy."""
         url = task['url']
-        task_id = task['task_id']
+        # Use get() with a default value instead of direct access
+        task_id = task.get('task_id', f"task-{uuid.uuid4()}")
         depth = task.get('depth', 0)
         max_depth = task.get('max_depth', 3)
         
@@ -249,61 +379,21 @@ class CrawlerNode:
                 # Process the results from the spider
                 if hasattr(spider, 'results') and spider.results:
                     for res in spider.results:
-                        # Print more detailed parsed content
+                        # Print only the parsed content
                         print("\n--- PARSED CONTENT ---")
                         print(f"URL: {res['url']}")
                         content = res['content']
-                        
-                        # Display title
-                        title = content.get('title', ['No title'])[0] if isinstance(content.get('title'), list) else content.get('title', 'No title')
-                        print(f"Title: {title}")
-                        
-                        # Display description
-                        description = content.get('description', ['No description'])[0] if isinstance(content.get('description'), list) else content.get('description', 'No description')
-                        print(f"Description: {description}")
-                        
-                        # Display keywords
-                        keywords = content.get('keywords', ['No keywords'])[0] if isinstance(content.get('keywords'), list) else content.get('keywords', 'No keywords')
-                        print(f"Keywords: {keywords}")
-                        
-                        # Display language
-                        language = content.get('language', ['Not specified'])[0] if isinstance(content.get('language'), list) else content.get('language', 'Not specified')
-                        print(f"Language: {language}")
-                        
-                        # Display content type
+                        print(f"Title: {content.get('title', ['No title'])[0] if isinstance(content.get('title'), list) else content.get('title', 'No title')}")
+                        print(f"Description: {content.get('description', ['No description'])[0] if isinstance(content.get('description'), list) else content.get('description', 'No description')}")
+                        print(f"Keywords: {content.get('keywords', ['No keywords'])[0] if isinstance(content.get('keywords'), list) else content.get('keywords', 'No keywords')}")
+                        print(f"Language: {content.get('language', ['Not specified'])[0] if isinstance(content.get('language'), list) else content.get('language', 'Not specified')}")
                         print(f"Content Type: {content.get('content_type', 'Unknown')}")
-                        
-                        # Display timestamp
-                        print(f"Timestamp: {content.get('timestamp', 'Unknown')}")
-                        
-                        # Display number of discovered URLs
                         print(f"Discovered URLs: {len(res['discovered_urls'])}")
-                        
-                        # Display a sample of discovered URLs (first 5)
-                        if res['discovered_urls']:
-                            print("\nSample of Discovered URLs:")
-                            for i, url in enumerate(res['discovered_urls'][:5]):
-                                print(f"  {i+1}. {url}")
-                        
-                        # Display extracted text (first 500 characters)
-                        if 'text' in content:
-                            text_content = content['text']
-                            if isinstance(text_content, list):
-                                # Join the list elements with spaces
-                                joined_text = ' '.join([str(item).strip() for item in text_content if str(item).strip()])
-                                # Display first 500 characters
-                                display_text = joined_text[:500] + '...' if len(joined_text) > 500 else joined_text
-                            else:
-                                display_text = text_content[:500] + '...' if len(text_content) > 500 else text_content
-                            
-                            print("\nExtracted Text (preview):")
-                            print(display_text)
-                        
                         print("--------------------\n")
                         
                         # Send the result to the master
                         self._send_result(res, task)
-
+            
             # Use crochet to run the crawl in a controlled way
             @crochet.wait_for(timeout=180)
             def run_spider():
@@ -327,22 +417,74 @@ class CrawlerNode:
                 pass
     
     def _send_result(self, result, original_task):
-        """Send crawl results back to the master node."""
+        """Send crawl results back to the master node and store in S3/DynamoDB."""
         # Add crawler ID and original task parameters to the result
         result['crawler_id'] = self.crawler_id
         result['max_depth'] = original_task.get('max_depth', 3)
         result['max_urls_per_domain'] = original_task.get('max_urls_per_domain', 100)
         
+        # Store raw HTML content in S3
+        s3_client = boto3.client('s3')
+        s3_bucket = 'web-crawl-storage'
+        s3_raw_path = f"raw-content/{result['task_id']}/{uuid.uuid4()}.html"
+        
+        try:
+            # Store the raw HTML in S3
+            if 'content' in result and 'html' in result['content']:
+                html_content = result['content']['html']
+                
+                # Convert to string if it's a list or other type
+                if isinstance(html_content, list):
+                    html_content = ''.join(html_content)
+                elif not isinstance(html_content, str):
+                    html_content = str(html_content)
+                
+                s3_client.put_object(
+                    Bucket=s3_bucket,
+                    Key=s3_raw_path,
+                    Body=html_content,
+                    ContentType='text/html'
+                )
+                
+                # Update the result with S3 path
+                result['s3_raw_path'] = s3_raw_path
+                
+                # Remove the full HTML content which is likely causing the size issue
+                del result['content']['html']
+        except Exception as e:
+            print(f"Error storing content in S3: {e}")
+        
+        # Update DynamoDB with crawl metadata
+        try:
+            dynamodb = boto3.resource('dynamodb')
+            metadata_table = dynamodb.Table('crawl-metadata')
+            
+            # Get job_id from the original task or generate a new one
+            job_id = original_task.get('job_id', f"job-{uuid.uuid4()}")
+            
+            metadata_table.put_item(
+                Item={
+                    'url': result['url'],
+                    'job_id': job_id,  # Add the required job_id field
+                    'title': result['content'].get('title', ''),
+                    'description': result['content'].get('description', ''),
+                    'content_type': result['content'].get('content_type', ''),
+                    'language': result['content'].get('language', ''),
+                    'crawl_time': datetime.now(timezone.utc).isoformat(),
+                    's3_raw_path': s3_raw_path,
+                    'http_status': 200,  # Assuming success since we have content
+                    'crawler_id': self.crawler_id
+                }
+            )
+        except Exception as e:
+            print(f"Error updating DynamoDB: {e}")
+        
         # Create a copy of the result to modify for sending
         result_to_send = result.copy()
         
-        # Remove the full HTML content which is likely causing the size issue
-        if 'content' in result_to_send and 'html' in result_to_send['content']:
-            # Either remove HTML completely
-            del result_to_send['content']['html']
-            
-            # Or truncate it to a reasonable size if you need some of it
-            # result_to_send['content']['html'] = result_to_send['content']['html'][:10000] + '...[truncated]'
+        # Send the message to SQS
+        message_body = json.dumps(result_to_send)
+        message_size = len(message_body.encode('utf-8'))
         
         # Truncate text content if it's too large
         if 'content' in result_to_send and 'text' in result_to_send['content']:
@@ -407,3 +549,48 @@ if __name__ == "__main__":
         crawler.start()
     except KeyboardInterrupt:
         crawler.stop()
+        
+        # Don't try to update URL frontier on shutdown as 'task' might not be defined
+        print("Crawler stopped by user")
+        
+        # After processing is complete, update URL frontier
+        try:
+            # Use crawler.dynamodb instead of self.dynamodb
+            frontier_table = crawler.dynamodb.Table('url-frontier')
+            
+            # Update the URL status to completed
+            frontier_table.update_item(
+                Key={'url':    task['url'],
+                     'job_id': task['job_id']
+                },
+                UpdateExpression="SET #status = :status, last_crawled = :timestamp",
+                ExpressionAttributeNames={
+                    '#status': 'status'
+                },
+                ExpressionAttributeValues={
+                    ':status': 'completed',
+                    ':timestamp': datetime.now(timezone.utc).isoformat()
+                }
+            )
+        except Exception as e:
+            print(f"Error updating URL frontier after completion: {e}")
+            
+        # Update URL frontier to mark as failed
+        try:
+            # Use crawler.dynamodb instead of self.dynamodb
+            frontier_table = crawler.dynamodb.Table('url-frontier')
+            
+            # Update the URL status to failed
+            frontier_table.update_item(
+                Key={'url': task['url']},
+                UpdateExpression="SET #status = :status, last_crawled = :timestamp",
+                ExpressionAttributeNames={
+                    '#status': 'status'
+                },
+                ExpressionAttributeValues={
+                    ':status': 'failed',
+                    ':timestamp': datetime.now(timezone.utc).isoformat()
+                }
+            )
+        except Exception as e_inner:
+            print(f"Error updating URL frontier after failure: {e_inner}")

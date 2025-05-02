@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Distributed Web Crawler - Search</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .search-box {
+            text-align: center;
+            margin: 40px 0;
+        }
+        .search-input {
+            width: 70%;
+            padding: 10px;
+            font-size: 16px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        .search-button {
+            padding: 10px 20px;
+            font-size: 16px;
+            background-color: #4285f4;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .search-button:hover {
+            background-color: #3b78e7;
+        }
+        .results {
+            margin-top: 20px;
+        }
+        .result-card {
+            background-color: white;
+            border-radius: 4px;
+            padding: 15px;
+            margin-bottom: 15px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .result-title {
+            color: #1a0dab;
+            font-size: 18px;
+            margin: 0 0 5px 0;
+        }
+        .result-url {
+            color: #006621;
+            font-size: 14px;
+            margin: 0 0 10px 0;
+        }
+        .result-description {
+            color: #545454;
+            font-size: 14px;
+            margin: 0;
+        }
+        .stats {
+            display: flex;
+            justify-content: space-between;
+            background-color: white;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .stat-item {
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #4285f4;
+        }
+        .stat-label {
+            font-size: 14px;
+            color: #545454;
+        }
+        .loading {
+            text-align: center;
+            margin: 20px 0;
+            display: none;
+        }
+        .no-results {
+            text-align: center;
+            margin: 20px 0;
+            color: #545454;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 style="text-align: center;">Distributed Web Crawler</h1>
+        
+        <div class="stats">
+            <div class="stat-item">
+                <div class="stat-value">{{ stats.urls_in_frontier }}</div>
+                <div class="stat-label">URLs in Frontier</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value">{{ stats.urls_indexed }}</div>
+                <div class="stat-label">URLs Indexed</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value">{{ stats.active_crawlers }}</div>
+                <div class="stat-label">Active Crawlers</div>
+            </div>
+        </div>
+        <!-- Add URL submission form -->
+<div class="url-submission" style="margin-top: 40px; background-color: white; padding: 20px; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+    <h2 style="text-align: center;">Submit URL for Crawling</h2>
+    <div style="display: flex; margin-bottom: 10px;">
+        <input type="text" id="url-input" class="search-input" placeholder="Enter URL to crawl..." style="flex-grow: 1; margin-right: 10px;">
+        <button id="submit-url-button" class="search-button">Submit</button>
+    </div>
+    <div style="display: flex; justify-content: space-between;">
+        <div>
+            <label for="max-depth">Max Depth:</label>
+            <input type="number" id="max-depth" min="1" max="5" value="3" style="width: 50px;">
+        </div>
+        <div>
+            <label for="max-urls">Max URLs per Domain:</label>
+            <input type="number" id="max-urls" min="10" max="500" value="100" style="width: 70px;">
+        </div>
+    </div>
+    <div id="url-submission-result" style="margin-top: 10px;"></div>
+</div>
+        <div class="search-box">
+            <input type="text" id="search-input" class="search-input" placeholder="Enter search query...">
+            <button id="search-button" class="search-button">Search</button>
+        </div>
+        
+        <div id="loading" class="loading">
+            <p>Searching...</p>
+        </div>
+        
+        <div id="results" class="results"></div>
+    </div>
+    
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const searchInput = document.getElementById('search-input');
+            const searchButton = document.getElementById('search-button');
+            const resultsDiv = document.getElementById('results');
+            const loadingDiv = document.getElementById('loading');
+            
+            // Function to perform search
+            function performSearch() {
+                const query = searchInput.value.trim();
+                if (!query) {
+                    return;
+                }
+                
+                // Show loading indicator
+                loadingDiv.style.display = 'block';
+                resultsDiv.innerHTML = '';
+                
+                // Perform search
+                fetch(`/search?q=${encodeURIComponent(query)}`)
+                    .then(response => response.json())
+                    .then(data => {
+                        // Hide loading indicator
+                        loadingDiv.style.display = 'none';
+                        
+                        // Display results
+                        if (data.results.length === 0) {
+                            resultsDiv.innerHTML = '<div class="no-results">No results found</div>';
+                            return;
+                        }
+                        
+                        // Create result cards
+                        let resultsHtml = '';
+                        data.results.forEach(result => {
+                            resultsHtml += `
+                                <div class="result-card">
+                                    <h3 class="result-title">${result.title || 'No Title'}</h3>
+                                    <p class="result-url">${result.url}</p>
+                                    <p class="result-description">${result.description || 'No description available'}</p>
+                                </div>
+                            `;
+                        });
+                        
+                        resultsDiv.innerHTML = resultsHtml;
+                    })
+                    .catch(error => {
+                        loadingDiv.style.display = 'none';
+                        resultsDiv.innerHTML = `<div class="no-results">Error: ${error.message}</div>`;
+                    });
+            }
+            
+            // Add event listeners
+            searchButton.addEventListener('click', performSearch);
+            searchInput.addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    performSearch();
+                }
+            });
+            
+            // URL submission functionality
+            const urlInput = document.getElementById('url-input');
+            const submitUrlButton = document.getElementById('submit-url-button');
+            const maxDepthInput = document.getElementById('max-depth');
+            const maxUrlsInput = document.getElementById('max-urls');
+            const urlSubmissionResult = document.getElementById('url-submission-result');
+            
+            submitUrlButton.addEventListener('click', function() {
+                const url = urlInput.value.trim();
+                if (!url) {
+                    urlSubmissionResult.innerHTML = '<p style="color: red;">Please enter a URL</p>';
+                    return;
+                }
+                
+                // Validate URL
+                if (!url.startsWith('http://') && !url.startsWith('https://')) {
+                    urlSubmissionResult.innerHTML = '<p style="color: red;">URL must start with http:// or https://</p>';
+                    return;
+                }
+                
+                // Show loading message
+                urlSubmissionResult.innerHTML = '<p>Submitting URL...</p>';
+                
+                // Submit URL
+                fetch('/submit_url', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        url: url,
+                        max_depth: parseInt(maxDepthInput.value),
+                        max_urls_per_domain: parseInt(maxUrlsInput.value)
+                    })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        urlSubmissionResult.innerHTML = `<p style="color: green;">${data.message}</p>`;
+                        urlInput.value = '';
+                    } else {
+                        urlSubmissionResult.innerHTML = `<p style="color: red;">${data.message}</p>`;
+                    }
+                })
+                .catch(error => {
+                    urlSubmissionResult.innerHTML = `<p style="color: red;">Error: ${error.message}</p>`;
+                });
+            });
+            
+            // Update stats periodically
+            function updateStats() {
+                fetch('/stats')
+                    .then(response => response.json())
+                    .then(data => {
+                        document.querySelector('.stat-value:nth-child(1)').textContent = data.urls_in_frontier;
+                        document.querySelector('.stat-value:nth-child(2)').textContent = data.urls_indexed;
+                        document.querySelector('.stat-value:nth-child(3)').textContent = data.active_crawlers;
+                    })
+                    .catch(error => console.error('Error updating stats:', error));
+            }
+            
+            // Update stats every 30 seconds
+            setInterval(updateStats, 30000);
+        });
+    </script>
+</body>
+</html>

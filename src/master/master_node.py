@@ -11,22 +11,37 @@ import threading
 import sys
 import os
 from datetime import datetime, timezone
+import logging
+import traceback
 
 # Add the parent directory to the path so we can import common modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.config import (
     CRAWL_TASK_QUEUE, CRAWL_RESULT_QUEUE, 
     INDEX_TASK_QUEUE, HEARTBEAT_INTERVAL,
-    CRAWL_DATA_BUCKET, AWS_REGION
+    CRAWL_DATA_BUCKET, AWS_REGION, MASTER_COMMAND_QUEUE
 )
 from common.utils import get_domain, normalize_url
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] [Master] %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('master_node.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
 class MasterNode:
     def __init__(self):
+        logger.info("Initializing master node")
         # Initialize AWS clients
         self.sqs = boto3.client('sqs', region_name=AWS_REGION)
         self.s3 = boto3.client('s3', region_name=AWS_REGION)
         self.dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
+        logger.info(f"AWS clients initialized with region: {AWS_REGION}")
         
         # Create queues if they don't exist
         self._create_queues()
@@ -51,23 +66,78 @@ class MasterNode:
         self.heartbeat_thread = threading.Thread(target=self._monitor_heartbeats)
         self.heartbeat_thread.daemon = True
         self.heartbeat_thread.start()
+        logger.info("Heartbeat monitoring thread started")
+        
+        logger.info("Master node initialization complete")
     
     def _create_queues(self):
-        """Get URLs for existing SQS queues."""
+        """Get URLs for existing SQS queues or create them if they don't exist."""
         try:
-            # Get queue URLs for existing queues
-            response = self.sqs.get_queue_url(QueueName=CRAWL_TASK_QUEUE)
-            self.crawl_task_queue_url = response['QueueUrl']
+            # Try to get queue URLs for existing queues, create if they don't exist
+            try:
+                response = self.sqs.get_queue_url(QueueName=CRAWL_TASK_QUEUE)
+                self.crawl_task_queue_url = response['QueueUrl']
+            except self.sqs.exceptions.QueueDoesNotExist:
+                # Create the queue if it doesn't exist
+                response = self.sqs.create_queue(
+                    QueueName=CRAWL_TASK_QUEUE,
+                    Attributes={
+                        'VisibilityTimeout': '60',  # 1 minute
+                        'MessageRetentionPeriod': '86400'  # 1 day
+                    }
+                )
+                self.crawl_task_queue_url = response['QueueUrl']
+                print(f"Created crawl task queue: {self.crawl_task_queue_url}")
             
-            response = self.sqs.get_queue_url(QueueName=CRAWL_RESULT_QUEUE)
-            self.crawl_result_queue_url = response['QueueUrl']
+            try:
+                response = self.sqs.get_queue_url(QueueName=CRAWL_RESULT_QUEUE)
+                self.crawl_result_queue_url = response['QueueUrl']
+            except self.sqs.exceptions.QueueDoesNotExist:
+                # Create the queue if it doesn't exist
+                response = self.sqs.create_queue(
+                    QueueName=CRAWL_RESULT_QUEUE,
+                    Attributes={
+                        'VisibilityTimeout': '60',  # 1 minute
+                        'MessageRetentionPeriod': '86400'  # 1 day
+                    }
+                )
+                self.crawl_result_queue_url = response['QueueUrl']
+                print(f"Created crawl result queue: {self.crawl_result_queue_url}")
             
-            response = self.sqs.get_queue_url(QueueName=INDEX_TASK_QUEUE)
-            self.index_task_queue_url = response['QueueUrl']
+            try:
+                response = self.sqs.get_queue_url(QueueName=INDEX_TASK_QUEUE)
+                self.index_task_queue_url = response['QueueUrl']
+            except self.sqs.exceptions.QueueDoesNotExist:
+                # Create the queue if it doesn't exist
+                response = self.sqs.create_queue(
+                    QueueName=INDEX_TASK_QUEUE,
+                    Attributes={
+                        'VisibilityTimeout': '60',  # 1 minute
+                        'MessageRetentionPeriod': '86400'  # 1 day
+                    }
+                )
+                self.index_task_queue_url = response['QueueUrl']
+                print(f"Created index task queue: {self.index_task_queue_url}")
             
-            print("Successfully connected to existing SQS queues")
+            # Add the master command queue
+            try:
+                response = self.sqs.get_queue_url(QueueName=MASTER_COMMAND_QUEUE)
+                self.master_command_queue_url = response['QueueUrl']
+            except self.sqs.exceptions.QueueDoesNotExist:
+                # Create the queue if it doesn't exist
+                response = self.sqs.create_queue(
+                    QueueName=MASTER_COMMAND_QUEUE,
+                    Attributes={
+                        'VisibilityTimeout': '60',  # 1 minute
+                        'MessageRetentionPeriod': '86400'  # 1 day
+                    }
+                )
+                self.master_command_queue_url = response['QueueUrl']
+                print(f"Created master command queue: {self.master_command_queue_url}")
+            
+            print("Successfully connected to SQS queues")
         except Exception as e:
-            print(f"Error getting SQS queue URLs: {e}")
+            print(f"Error getting/creating SQS queue URLs: {e}")
             raise
     
     def _ensure_dynamodb_tables(self):
@@ -87,10 +157,12 @@ class MasterNode:
                 },
                 'crawl-metadata': {
                     'KeySchema': [
-                        {'AttributeName': 'url', 'KeyType': 'HASH'}
+                        {'AttributeName': 'url', 'KeyType': 'HASH'},
+                        {'AttributeName': 'job_id', 'KeyType': 'RANGE'}
                     ],
                     'AttributeDefinitions': [
-                        {'AttributeName': 'url', 'AttributeType': 'S'}
+                        {'AttributeName': 'url', 'AttributeType': 'S'},
+                        {'AttributeName': 'job_id', 'AttributeType': 'S'}
                     ]
                 },
                 'crawler-status': {
@@ -140,21 +212,24 @@ class MasterNode:
     
     def start_crawl(self, seed_urls, max_depth=3, max_urls_per_domain=100):
         """Start a new crawl with the given seed URLs."""
-        print(f"Starting crawl with {len(seed_urls)} seed URLs")
-        
-        # Generate a crawl ID
         crawl_id = str(uuid.uuid4())
+        logger.info(f"Starting crawl {crawl_id} with {len(seed_urls)} seed URLs (max_depth: {max_depth}, max_urls_per_domain: {max_urls_per_domain})")
         
         # Record crawl start in DynamoDB
         self._record_crawl_start(crawl_id, seed_urls, max_depth, max_urls_per_domain)
         
         # Normalize seed URLs
         normalized_urls = [normalize_url(url) for url in seed_urls]
+        logger.debug(f"Normalized seed URLs: {normalized_urls}")
         
         # Create crawl tasks for seed URLs
         for url in normalized_urls:
+            logger.info(f"Enqueueing seed URL: {url} for crawl {crawl_id}")
             self._enqueue_url(url, depth=0, max_depth=max_depth, 
                              max_urls_per_domain=max_urls_per_domain, crawl_id=crawl_id)
+        
+        logger.info(f"Crawl {crawl_id} started successfully with {len(seed_urls)} seed URLs")
+        return crawl_id
     
     def _record_crawl_start(self, crawl_id, seed_urls, max_depth, max_urls_per_domain):
         """Record crawl start information in DynamoDB."""
@@ -193,58 +268,128 @@ class MasterNode:
         except Exception as e:
             print(f"Error recording crawl start: {e}")
     
-    def _enqueue_url(self, url, depth, max_depth, max_urls_per_domain, crawl_id=None):
-        """Enqueue a URL for crawling if it meets the criteria."""
-        with self.lock:
-            # Skip if URL is already being processed or completed
-            if url in self.urls_in_progress or url in self.urls_completed:
-                return False
-            
-            # Check depth limit
-            if depth > max_depth:
-                return False
-            
-            # Check domain URL limit
-            domain = get_domain(url)
-            if self.domain_url_counts[domain] >= max_urls_per_domain:
-                return False
-            
-            # Mark URL as in progress
-            self.urls_in_progress.add(url)
-            self.domain_url_counts[domain] += 1
+    def _enqueue_url(self, url, depth=0, max_depth=3, max_urls_per_domain=100, crawl_id=None):
+        """
+        Enqueue a URL for crawling.
         
-        # Create a crawl task
-        task_id = str(uuid.uuid4())
-        job_id = f"job-{uuid.uuid4()}" if crawl_id is None else f"job-{crawl_id}"
-        
-        task = {
-            'task_id': task_id,
-            'url': url,
-            'depth': depth,
-            'max_depth': max_depth,
-            'max_urls_per_domain': max_urls_per_domain,
-            'job_id': job_id,
-            'crawl_id': crawl_id if crawl_id else str(uuid.uuid4())
-        }
-        
-        # Send the task to the queue
+        Args:
+            url (str): The URL to crawl
+            depth (int): Current depth of the URL
+            max_depth (int): Maximum depth to crawl
+            max_urls_per_domain (int): Maximum URLs to crawl per domain
+            crawl_id (str): ID of the crawl job
+        """
         try:
-            self.sqs.send_message(
-                QueueUrl=self.crawl_task_queue_url,
-                MessageBody=json.dumps(task)
-            )
-            print(f"Enqueued URL: {url} (depth: {depth})")
-            return True
-        except Exception as e:
-            print(f"Error adding URL to frontier: {e}")
-            # Roll back the in-progress status
+            # Skip if we've reached max depth
+            if depth > max_depth:
+                logger.debug(f"Skipping URL {url} - max depth reached ({depth} > {max_depth})")
+                return
+            
+            # Generate a crawl ID if not provided
+            if not crawl_id:
+                crawl_id = str(uuid.uuid4())
+                logger.debug(f"Generated new crawl ID: {crawl_id} for URL: {url}")
+            
+            # Check if URL is already in progress or completed
             with self.lock:
-                self.urls_in_progress.remove(url)
-                self.domain_url_counts[domain] -= 1
-            return False
-    
+                if url in self.urls_in_progress or url in self.urls_completed:
+                    logger.debug(f"Skipping URL {url} - already in progress or completed")
+                    return
+                
+                # Check domain-specific limits
+                domain = get_domain(url)
+                if self.domain_url_counts[domain] >= max_urls_per_domain:
+                    logger.info(f"Skipping URL {url} - reached max URLs for domain {domain} ({max_urls_per_domain})")
+                    return
+                
+                # Mark URL as in progress and increment domain count
+                self.urls_in_progress.add(url)
+                self.domain_url_counts[domain] += 1
+            
+            # Check if URL is already in the frontier
+            try:
+                frontier_table = self.dynamodb.Table('url-frontier')
+                job_id = f"job-{crawl_id}"
+                
+                try:
+                    response = frontier_table.get_item(
+                        Key={
+                            'url': url,
+                            'job_id': job_id
+                        }
+                    )
+                except self.dynamodb.meta.client.exceptions.ResourceNotFoundException:
+                    # Table doesn't exist, create it
+                    self._ensure_dynamodb_tables()
+                    response = {}
+                
+                if 'Item' in response:
+                    status = response['Item'].get('status')
+                    logger.info(f"URL {url} already in frontier with status: {status}")
+                    if status in ['completed', 'in_progress']:
+                        # URL already processed or being processed
+                        with self.lock:
+                            self.urls_in_progress.discard(url)
+                            if status == 'completed':
+                                self.urls_completed.add(url)
+                        logger.debug(f"Skipping URL {url} - already {status}")
+                        return
+
+                # Create a task for the URL
+                task = {
+                    'url': url,
+                    'depth': depth,
+                    'max_depth': max_depth,
+                    'max_urls_per_domain': max_urls_per_domain,
+                    'task_id': f"task-{uuid.uuid4()}",
+                    'job_id': job_id,
+                    'timestamp': datetime.now(timezone.utc).isoformat()
+                }
+
+                # Add to URL frontier
+                try:
+                    frontier_table.put_item(
+                        Item={
+                            'url': url,
+                            'job_id': job_id,
+                            'status': 'pending',
+                            'depth': depth,
+                            'created_at': datetime.now(timezone.utc).isoformat(),
+                            'task_id': task['task_id']
+                        }
+                    )
+                except self.dynamodb.meta.client.exceptions.ResourceNotFoundException:
+                    # Table doesn't exist, create it and retry
+                    self._ensure_dynamodb_tables()
+                    frontier_table.put_item(
+                        Item={
+                            'url': url,
+                            'job_id': job_id,
+                            'status': 'pending',
+                            'depth': depth,
+                            'created_at': datetime.now(timezone.utc).isoformat(),
+                            'task_id': task['task_id']
+                        }
+                    )
+
+                # Send the task to the queue
+                self.sqs.send_message(
+                    QueueUrl=self.crawl_task_queue_url,
+                    MessageBody=json.dumps(task)
+                )
+                logger.debug(f"Task sent to queue for URL: {url}")
+
+            except Exception as e:
+                logger.error(f"Error processing URL {url}: {e}")
+                logger.error(traceback.format_exc())
+                with self.lock:
+                    self.urls_in_progress.discard(url)
+                    self.domain_url_counts[domain] -= 1
+        except Exception as e:
+            logger.error(f"Error enqueueing URL {url}: {e}")
+            logger.error(traceback.format_exc())
     def process_crawl_results(self):
-        """Process crawl results from the queue."""
+        """Process incoming crawl result messages."""
         try:
             # Receive messages from the crawl result queue
             response = self.sqs.receive_message(
@@ -262,57 +407,12 @@ class MasterNode:
                     result = json.loads(message['Body'])
                     
                     # Check if this is a heartbeat message
-                    if 'status' in result and result.get('status') == 'active':
+                    if 'crawler_id' in result and 'status' in result and result.get('status') == 'active':
                         self._handle_heartbeat(result)
-                        continue
                     
-                    # Process the crawl result
-                    url = result.get('url')
-                    discovered_urls = result.get('discovered_urls', [])
-                    depth = result.get('depth', 0)
-                    max_depth = result.get('max_depth', 3)
-                    max_urls_per_domain = result.get('max_urls_per_domain', 100)
-                    crawl_id = result.get('crawl_id')
-                    
-                    # Update URL status in DynamoDB
-                    try:
-                        job_id = result.get('job_id', f"job-{uuid.uuid4()}")
-                        
-                        self.dynamodb.Table('url-frontier').update_item(
-                            Key={
-                                'url': url,
-                                'job_id': job_id
-                            },
-                            UpdateExpression="SET #status = :status, completed_at = :timestamp",
-                            ExpressionAttributeNames={
-                                '#status': 'status'
-                            },
-                            ExpressionAttributeValues={
-                                ':status': 'completed',
-                                ':timestamp': datetime.now(timezone.utc).isoformat()
-                            }
-                        )
-                    except Exception as e:
-                        print(f"Error updating URL status: {e}")
-                    
-                    # Mark URL as completed
-                    with self.lock:
-                        if url in self.urls_in_progress:
-                            self.urls_in_progress.remove(url)
-                        self.urls_completed.add(url)
-                    
-                    # Enqueue discovered URLs
-                    for discovered_url in discovered_urls:
-                        self._enqueue_url(
-                            url=discovered_url,
-                            depth=depth + 1,
-                            max_depth=max_depth,
-                            max_urls_per_domain=max_urls_per_domain,
-                            crawl_id=crawl_id
-                        )
-                    
-                    # Send content to indexer
-                    self._send_to_indexer(result)
+                    # Otherwise, process as a crawl result
+                    elif 'url' in result and 'content' in result:
+                        self._process_crawl_result(result)
                     
                     # Delete the processed message
                     self.sqs.delete_message(
@@ -324,16 +424,44 @@ class MasterNode:
         except Exception as e:
             print(f"Error receiving crawl results: {e}")
     
-    def _update_crawler_status(self, crawler_id, result):
+    def _handle_heartbeat(self, heartbeat):
+        """Handle a heartbeat message from a crawler node."""
+        crawler_id = heartbeat.get('crawler_id')
+        timestamp = heartbeat.get('timestamp', time.time())
+        
+        if crawler_id:
+            with self.lock:
+                # Update the last heartbeat time for this crawler
+                self.active_crawlers[crawler_id] = timestamp
+                
+            # Update the crawler status in DynamoDB
+            try:
+                self.dynamodb.Table('crawler-status').put_item(
+                    Item={
+                        'crawler_id': crawler_id,
+                        'last_heartbeat': datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
+                        'status': 'active'
+                    }
+                )
+            except Exception as e:
+                print(f"Error updating crawler status in DynamoDB: {e}")
+                
+            print(f"Received heartbeat from crawler: {crawler_id}")
+    
+    def _update_crawler_status(self, crawler_id, status_data):
         """Update crawler status in DynamoDB."""
         try:
-            self.dynamodb.Table('crawler-status').put_item(
+            # Get the crawler-status table
+            table = self.dynamodb.Table('crawler-status')
+            
+            # Update the crawler status
+            table.put_item(
                 Item={
                     'crawler_id': crawler_id,
+                    'status': status_data.get('status', 'unknown'),
                     'last_heartbeat': datetime.now(timezone.utc).isoformat(),
-                    'status': 'active',
-                    'last_url': result.get('url', ''),
-                    'crawl_id': result.get('crawl_id', 'unknown')
+                    'urls_crawled': status_data.get('urls_crawled', 0),
+                    'current_url': status_data.get('current_url', 'none')
                 }
             )
         except Exception as e:
@@ -525,28 +653,25 @@ class MasterNode:
         return stats
     
     def run(self):
-        """Run the master node main loop."""
+        """Run the master node."""
         print("Master node running...")
-        try:
-            last_stats_time = time.time()
-            stats_interval = 300  # 5 minutes
-            
-            while True:
+        
+        while True:
+            try:
                 # Process crawl results
                 self.process_crawl_results()
                 
-                # Periodically save stats
-                current_time = time.time()
-                if current_time - last_stats_time > stats_interval:
-                    self.get_crawl_stats()
-                    last_stats_time = current_time
+                # Process commands from clients
+                self.process_commands()
                 
-                # Sleep briefly to avoid tight loop
+                # Sleep briefly to avoid CPU spinning
                 time.sleep(0.1)
-        except KeyboardInterrupt:
-            print("Master node shutting down...")
-            # Save final stats before shutting down
-            self.get_crawl_stats()
+            except KeyboardInterrupt:
+                print("Master node shutting down...")
+                break
+            except Exception as e:
+                print(f"Error in master node main loop: {e}")
+                time.sleep(1)
 
 def process_client_requests(self):
     """Process client requests from the task queue."""
@@ -598,25 +723,31 @@ def process_crawl_tasks(self):
         )
         
         if 'Messages' not in response:
+            logger.debug("No messages received from crawl task queue")
             return
         
+        logger.info(f"Received {len(response['Messages'])} messages from crawl task queue")
         for message in response['Messages']:
             try:
                 # Parse the message
                 task = json.loads(message['Body'])
+                message_id = message.get('MessageId', 'unknown')
+                logger.info(f"Processing message {message_id}, action: {task.get('action', 'unknown')}")
                 
                 # Check if this is a URL from the search interface
                 if task.get('action') == 'crawl_url' and task.get('source') == 'search_interface':
                     url = task.get('url')
                     if url:
-                        print(f"Received URL from search interface: {url}")
+                        logger.info(f"Received URL from search interface: {url}")
                         # Create a crawl task for this URL
+                        crawl_id = str(uuid.uuid4())
+                        logger.info(f"Creating new crawl {crawl_id} for URL: {url}")
                         self._enqueue_url(
                             url=url,
                             depth=0,
                             max_depth=MAX_DEPTH,
                             max_urls_per_domain=MAX_URLS_PER_DOMAIN,
-                            crawl_id=str(uuid.uuid4())
+                            crawl_id=crawl_id
                         )
                 # Handle other task types (like start_crawl from client)
                 elif task.get('action') == 'start_crawl':
@@ -625,61 +756,126 @@ def process_crawl_tasks(self):
                     max_urls_per_domain = task.get('max_urls_per_domain', MAX_URLS_PER_DOMAIN)
                     
                     if url:
+                        crawl_id = str(uuid.uuid4())
+                        logger.info(f"Starting new crawl {crawl_id} for URL: {url} (max_depth: {max_depth}, max_urls_per_domain: {max_urls_per_domain})")
                         self._enqueue_url(
                             url=url,
                             depth=0,
                             max_depth=max_depth,
                             max_urls_per_domain=max_urls_per_domain,
-                            crawl_id=str(uuid.uuid4())
+                            crawl_id=crawl_id
                         )
                 
                 # Delete the processed message
+                logger.debug(f"Deleting message {message_id} from crawl task queue")
                 self.sqs.delete_message(
                     QueueUrl=self.crawl_task_queue_url,
                     ReceiptHandle=message['ReceiptHandle']
                 )
+                logger.info(f"Successfully processed message {message_id}")
             except Exception as e:
-                print(f"Error processing crawl task: {e}")
+                logger.error(f"Error processing crawl task message {message.get('MessageId', 'unknown')}: {e}")
+                logger.error(traceback.format_exc())
     except Exception as e:
-        print(f"Error receiving crawl tasks: {e}")
+        logger.error(f"Error receiving crawl tasks: {e}")
+        logger.error(traceback.format_exc())
 
 def start(self):
     """Start the master node."""
     print("Starting master node")
-    
+
     # Main processing loop
     while True:
         try:
             # Process crawl results
             self.process_crawl_results()
-            
+
             # Process client requests
             self.process_client_requests()
-            
+
+            # Process direct commands from clients
+            self.process_master_commands()
+
             # Sleep briefly to avoid tight looping
             time.sleep(1)
         except Exception as e:
             print(f"Error in master node main loop: {e}")
-            time.sleep(5)  # Sleep longer on error
+            time.sleep(5)
 
-if __name__ == "__main__":
-    master = MasterNode()
+def process_master_commands(self):
+    """Process commands sent directly to the master node."""
     try:
-        print("Master node running. Press Ctrl+C to stop.")
-        while True:
-            master.process_crawl_results()
-            time.sleep(1)  # Avoid CPU spinning
-    except KeyboardInterrupt:
-        print("Master node stopped by user")
-    # Example: Start a crawl with some seed URLs
-    '''   seed_urls = [
-        "http://books.toscrape.com/",
-        "https://quotes.toscrape.com/"
-    ]
-    '''
-    
- #   master.start_crawl(seed_urls)
-  #  master.run()
+        # Receive messages from the master command queue
+        response = self.sqs.receive_message(
+            QueueUrl=self.master_command_queue_url,
+            MaxNumberOfMessages=10,
+            WaitTimeSeconds=1
+        )
+        
+        if 'Messages' not in response:
+            return
+        
+        for message in response['Messages']:
+            try:
+                # Parse the message
+                command = json.loads(message['Body'])
+                print(f"Received command: {command}")
+                
+                # Handle different command formats
+                if command.get('action') == 'crawl_url' and command.get('source') == 'search_interface':
+                    url = command.get('url')
+                    if url:
+                        print(f"Received URL from search interface: {url}")
+                        # Create a crawl task for this URL
+                        self._enqueue_url(
+                            url=url,
+                            depth=0,
+                            max_depth=command.get('max_depth', 3),
+                            max_urls_per_domain=command.get('max_urls_per_domain', 100),
+                            crawl_id=str(uuid.uuid4())
+                        )
+                # Handle command format from submit_url.py
+                elif command.get('type') == 'crawl_url':
+                    url = command.get('url')
+                    if url:
+                        print(f"Received URL from client: {url}")
+                        self._enqueue_url(
+                            url=url,
+                            depth=0,
+                            max_depth=command.get('max_depth', 3),
+                            max_urls_per_domain=command.get('max_urls_per_domain', 100),
+                            crawl_id=str(uuid.uuid4())
+                        )
+                # Handle command format from dashboard
+                elif command.get('command') == 'start_crawl':
+                    seed_urls = command.get('seed_urls', [])
+                    if seed_urls:
+                        print(f"Received seed URLs from dashboard: {seed_urls}")
+                        self.start_crawl(
+                            seed_urls,
+                            max_depth=command.get('max_depth', 3),
+                            max_urls_per_domain=command.get('max_urls_per_domain', 100)
+                        )
+                # Handle action format from client.py
+                elif command.get('action') == 'start_crawl':
+                    seed_urls = command.get('seed_urls', [])
+                    if seed_urls:
+                        print(f"Received seed URLs from client: {seed_urls}")
+                        self.start_crawl(
+                            seed_urls,
+                            max_depth=command.get('max_depth', 3),
+                            max_urls_per_domain=command.get('max_urls_per_domain', 100)
+                        )
+                
+                # Delete the processed message
+                self.sqs.delete_message(
+                    QueueUrl=self.master_command_queue_url,
+                    ReceiptHandle=message['ReceiptHandle']
+                )
+            except Exception as e:
+                print(f"Error processing master command: {e}")
+    except Exception as e:
+        print(f"Error receiving master commands: {e}")
 
 def receive_client_url(self, url, max_depth=3, max_urls_per_domain=100):
     """
@@ -703,3 +899,34 @@ def receive_client_url(self, url, max_depth=3, max_urls_per_domain=100):
     self.start_crawl([normalized_url], max_depth, max_urls_per_domain)
     
     return crawl_id
+
+
+def _handle_heartbeat(self, result):
+    """Handle heartbeat message from crawler."""
+    crawler_id = result.get('crawler_id')
+    if crawler_id:
+        with self.lock:
+            self.active_crawlers[crawler_id] = time.time()
+        
+        # Update in DynamoDB
+        self._update_crawler_status(crawler_id, result)
+
+# Add this main execution block at the end of the file
+if __name__ == "__main__":
+    try:
+        # Create and start the master node
+        master = MasterNode()
+        print("Master node initialized successfully")
+        
+        # Main processing loop
+        print("Starting main processing loop...")
+        while True:
+            # Process crawl results
+            master.process_crawl_results()
+            
+            # Sleep briefly to avoid CPU spinning
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("Master node shutting down...")
+    except Exception as e:
+        print(f"Error in master node: {e}")

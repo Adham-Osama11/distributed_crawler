@@ -1,4 +1,5 @@
 
+
 <!DOCTYPE html>
 <html>
 <head>
@@ -374,16 +375,19 @@
 
         /* Responsive adjustments */
         @media (max-width: 768px) {
-            .status-container,
-            .search-container,
-            .dashboard-header {
+            .status-container {
+                flex-direction: column;
+            }
+            
+            .search-container {
                 flex-direction: column;
             }
             
             .dashboard-header {
+                flex-direction: column;
                 align-items: flex-start;
             }
-
+            
             .dashboard-header .timestamp {
                 margin-top: 10px;
             }
@@ -391,7 +395,7 @@
         </style>
     </head>
     <body>
-         <div class="dashboard-container">
+        <div class="dashboard-container">
             <div class="dashboard-header">
                 <h1><i class="fas fa-spider"></i> Distributed Crawler Dashboard</h1>
                 <div class="timestamp">Last updated: <span id="update-time"></span></div>
@@ -513,7 +517,22 @@
                     tabs[0].click();
                 }
             });
+        function fetchSystemStatus() {
+        fetch('/api/system-status')
+           .then(response => response.json())
+           .then(data => {
+            // Update the system status cards
+            document.getElementById('active-crawlers').textContent = data.active_crawlers || 0;
+            document.getElementById('completed-urls').textContent = data.url_counts?.completed || 0;
+            document.getElementById('pending-urls').textContent = data.url_counts?.pending || 0;
+            document.getElementById('crawl-rate').textContent = data.crawl_rate || 0;
             
+            // Update timestamp
+            updateTimestamp();
+        })
+        .catch(error => {
+            console.error('Error fetching system status:', error);
+        });}
             // Load tab content
             function loadTabContent(tabId) {
                 const contentDiv = document.getElementById('tab-content');

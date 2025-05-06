@@ -12,6 +12,17 @@ from datetime import datetime, timedelta, timezone
 import sys
 import os
 import json
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] [Dashboard] %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('dashboard.log')
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # Add the parent directory to the path so we can import common modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -51,6 +62,43 @@ class CrawlerDashboard:
             """API endpoint for crawl progress data."""
             return jsonify(self.get_crawl_progress())
         
+        @self.app.route('/api/crawler-nodes')
+        def crawler_nodes():
+            """API endpoint to get active crawler nodes."""
+            try:
+                # Get the current time
+                now = datetime.now(timezone.utc)
+                
+                # Define the cutoff time for active crawlers (e.g., last 2 minutes)
+                cutoff_time = now - timedelta(minutes=2)
+                cutoff_time_str = cutoff_time.isoformat()
+                
+                # Query the crawler-status table
+                table = self.dynamodb.Table('crawler-status')
+                response = table.scan()
+                
+                # Filter for active crawlers
+                active_crawlers = []
+                for item in response.get('Items', []):
+                    last_heartbeat = item.get('last_heartbeat')
+                    if last_heartbeat and last_heartbeat > cutoff_time_str:
+                        active_crawlers.append({
+                            'crawler_id': item.get('crawler_id'),
+                            'last_heartbeat': last_heartbeat,
+                            'urls_crawled': item.get('urls_crawled', 0),
+                            'current_url': item.get('current_url', 'None')
+                        })
+                
+                return jsonify({
+                    'crawler_nodes': active_crawlers
+                })
+            except Exception as e:
+                print(f"Error getting crawler nodes: {e}")
+                return jsonify({
+                    'crawler_nodes': [],
+                    'error': str(e)
+                })
+        
         @self.app.route('/api/search', methods=['POST'])
         def search():
             """API endpoint for search functionality."""
@@ -79,7 +127,7 @@ class CrawlerDashboard:
             idle_crawlers = 0
             
             # Get counts from DynamoDB
-            table = self.dynamodb.Table('crawler-nodes')
+            table = self.dynamodb.Table('crawler-status')
             response = table.scan()
             
             for item in response.get('Items', []):
@@ -534,19 +582,18 @@ class CrawlerDashboard:
         """Run the dashboard server without opening a browser window."""
         self.app.run(host=host, port=port, debug=debug)
 
+# Create templates directory and dashboard.html template
+import os
+
 def create_templates(app):
-    """Create the dashboard.html template file."""
-    # Create templates directory if it doesn't exist
+    """Create the templates directory and dashboard.html file."""
     templates_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'templates')
     os.makedirs(templates_dir, exist_ok=True)
     
-    # Set the template folder for the Flask app
-    app.template_folder = templates_dir
-    
-    # Create dashboard.html file
     dashboard_html_path = os.path.join(templates_dir, 'dashboard.html')
     with open(dashboard_html_path, 'w') as f:
         f.write('''
+
 <!DOCTYPE html>
 <html>
 <head>
@@ -922,16 +969,19 @@ def create_templates(app):
 
         /* Responsive adjustments */
         @media (max-width: 768px) {
-            .status-container,
-            .search-container,
-            .dashboard-header {
+            .status-container {
+                flex-direction: column;
+            }
+            
+            .search-container {
                 flex-direction: column;
             }
             
             .dashboard-header {
+                flex-direction: column;
                 align-items: flex-start;
             }
-
+            
             .dashboard-header .timestamp {
                 margin-top: 10px;
             }
@@ -939,7 +989,7 @@ def create_templates(app):
         </style>
     </head>
     <body>
-         <div class="dashboard-container">
+        <div class="dashboard-container">
             <div class="dashboard-header">
                 <h1><i class="fas fa-spider"></i> Distributed Crawler Dashboard</h1>
                 <div class="timestamp">Last updated: <span id="update-time"></span></div>
@@ -1061,7 +1111,22 @@ def create_templates(app):
                     tabs[0].click();
                 }
             });
+        function fetchSystemStatus() {
+        fetch('/api/system-status')
+           .then(response => response.json())
+           .then(data => {
+            // Update the system status cards
+            document.getElementById('active-crawlers').textContent = data.active_crawlers || 0;
+            document.getElementById('completed-urls').textContent = data.url_counts?.completed || 0;
+            document.getElementById('pending-urls').textContent = data.url_counts?.pending || 0;
+            document.getElementById('crawl-rate').textContent = data.crawl_rate || 0;
             
+            // Update timestamp
+            updateTimestamp();
+        })
+        .catch(error => {
+            console.error('Error fetching system status:', error);
+        });}
             // Load tab content
             function loadTabContent(tabId) {
                 const contentDiv = document.getElementById('tab-content');
@@ -1245,7 +1310,6 @@ def create_templates(app):
     </body>
 </html>
         ''')
-    
     print(f"Created dashboard.html template at {dashboard_html_path}")
 if __name__ == "__main__":
     dashboard = CrawlerDashboard()

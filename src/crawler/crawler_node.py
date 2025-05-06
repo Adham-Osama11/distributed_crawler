@@ -16,14 +16,26 @@ from datetime import datetime, timezone
 import sys
 import os
 import threading
+import logging
+import traceback
 
 # Add the parent directory to the path so we can import common modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.config import (
     CRAWL_TASK_QUEUE, CRAWL_RESULT_QUEUE, 
-    HEARTBEAT_INTERVAL
+    HEARTBEAT_INTERVAL, AWS_REGION , CRAWL_DATA_BUCKET
 )
 from common.utils import get_domain, normalize_url
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] [Crawler] %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('crawler_node.log')
+    ]
+)
+logger = logging.getLogger(__name__)
 
 class WebPage(Item):
     """Scrapy Item for storing web page data."""
@@ -120,20 +132,80 @@ class CrawlerNode:
     """
     def __init__(self, crawler_id=None):
         self.crawler_id = crawler_id or f"crawler-{uuid.uuid4()}"
-        # Specify the region when creating the client
-        self.sqs = boto3.client('sqs', region_name='us-east-1')  # Use the region from your config
+        # Use the region from config instead of hardcoding
+        self.sqs = boto3.client('sqs', region_name=AWS_REGION)
         
-        # Initialize S3 and DynamoDB clients
-        self.s3 = boto3.client('s3', region_name='us-east-1')
-        self.dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+        # Initialize S3 and DynamoDB clients with the same region
+        self.s3 = boto3.client('s3', region_name=AWS_REGION)
+        self.dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
         
-        # Get queue URLs
-        response = self.sqs.get_queue_url(QueueName=CRAWL_TASK_QUEUE)
-        self.crawl_task_queue_url = response['QueueUrl']
+        # Get queue URLs or create them if they don't exist
+        try:
+            logger.info(f"Connecting to SQS queue: {CRAWL_TASK_QUEUE}")
+            response = self.sqs.get_queue_url(QueueName=CRAWL_TASK_QUEUE)
+            self.crawl_task_queue_url = response['QueueUrl']
+            logger.info(f"Connected to crawl task queue: {self.crawl_task_queue_url}")
+        except self.sqs.exceptions.QueueDoesNotExist:
+            # Create the queue if it doesn't exist
+            response = self.sqs.create_queue(
+                QueueName=CRAWL_TASK_QUEUE,
+                Attributes={
+                    'VisibilityTimeout': '60',  # 1 minute
+                    'MessageRetentionPeriod': '86400'  # 1 day
+                }
+            )
+            self.crawl_task_queue_url = response['QueueUrl']
+            print(f"Created crawl task queue: {self.crawl_task_queue_url}")
         
-        response = self.sqs.get_queue_url(QueueName=CRAWL_RESULT_QUEUE)
-        self.crawl_result_queue_url = response['QueueUrl']
+        try:
+            response = self.sqs.get_queue_url(QueueName=CRAWL_RESULT_QUEUE)
+            self.crawl_result_queue_url = response['QueueUrl']
+        except self.sqs.exceptions.QueueDoesNotExist:
+            # Create the queue if it doesn't exist
+            logger.warning(f"Queue {CRAWL_RESULT_QUEUE} does not exist, creating it")
+            response = self.sqs.create_queue(
+                QueueName=CRAWL_RESULT_QUEUE,
+                Attributes={
+                    'VisibilityTimeout': '60',  # 1 minute
+                    'MessageRetentionPeriod': '86400'  # 1 day
+                }
+            )
+            self.crawl_result_queue_url = response['QueueUrl']
+        logger.info(f"Connected to crawl result queue: {self.crawl_result_queue_url}")
         
+        try:
+            # Test connectivity to task queue
+            self.sqs.get_queue_attributes(
+                QueueUrl=self.crawl_task_queue_url,
+                AttributeNames=['QueueArn']
+            )
+            logger.info(f"Successfully connected to task queue: {self.crawl_task_queue_url}")
+            
+            # Test connectivity to result queue
+            self.sqs.get_queue_attributes(
+                QueueUrl=self.crawl_result_queue_url,
+                AttributeNames=['QueueArn']
+            )
+            logger.info(f"Successfully connected to result queue: {self.crawl_result_queue_url}")
+        except Exception as e:
+            logger.error(f"Error testing queue connectivity: {e}")
+        
+        try:
+            # Test connectivity to task queue
+            self.sqs.get_queue_attributes(
+                QueueUrl=self.crawl_task_queue_url,
+                AttributeNames=['QueueArn']
+            )
+            logger.info(f"Successfully connected to task queue: {self.crawl_task_queue_url}")
+            
+            # Test connectivity to result queue
+            self.sqs.get_queue_attributes(
+                QueueUrl=self.crawl_result_queue_url,
+                AttributeNames=['QueueArn']
+            )
+            logger.info(f"Successfully connected to result queue: {self.crawl_result_queue_url}")
+        except Exception as e:
+            logger.error(f"Error testing queue connectivity: {e}")
         # Initialize Scrapy settings
         self.settings = get_project_settings()
         self.settings.update({
@@ -143,8 +215,9 @@ class CrawlerNode:
             'CONCURRENT_REQUESTS': 1,  # Start with just 1 concurrent request
             'LOG_LEVEL': 'ERROR',  # Only show errors, not info messages
             'LOG_ENABLED': False,  # Disable logging completely if you want no output
+            'REQUEST_FINGERPRINTER_IMPLEMENTATION': '2.7',  # Add this line to fix the deprecation warning
         })
-        
+        logger.info("Scrapy settings initialized")
         # Flag to control the crawler
         self.running = False
         
@@ -154,6 +227,7 @@ class CrawlerNode:
         # Start heartbeat thread
         self.heartbeat_thread = threading.Thread(target=self._send_heartbeats)
         self.heartbeat_thread.daemon = True
+        logger.info("Crawler node initialization complete")
     
     def _ensure_dynamodb_tables(self):
         """Ensure required DynamoDB tables exist."""
@@ -172,10 +246,12 @@ class CrawlerNode:
                 },
                 'crawl-metadata': {
                     'KeySchema': [
-                        {'AttributeName': 'url', 'KeyType': 'HASH'}
+                        {'AttributeName': 'url', 'KeyType': 'HASH'},
+                        {'AttributeName': 'job_id', 'KeyType': 'RANGE'}  # Add job_id as a sort key
                     ],
                     'AttributeDefinitions': [
-                        {'AttributeName': 'url', 'AttributeType': 'S'}
+                        {'AttributeName': 'url', 'AttributeType': 'S'},
+                        {'AttributeName': 'job_id', 'AttributeType': 'S'}  # Define job_id attribute
                     ]
                 }
             }
@@ -211,11 +287,14 @@ class CrawlerNode:
         
         # Start heartbeat thread
         self.heartbeat_thread.start()
-        
+        logger.info("Heartbeat thread started")
+
         # Register with master node
         self._register_with_master()
-        
+        logger.info("Registered with master node")
+
         # Main crawling loop
+        logger.info("Entering main crawling loop")
         while self.running:
             try:
                 # Get a task from the queue
@@ -223,14 +302,16 @@ class CrawlerNode:
                 
                 if task:
                     # Process the task
+                    logger.info(f"Processing task for URL: {task.get('url')} (depth: {task.get('depth', 0)})")
                     self._process_task(task)
                 else:
                     # No tasks available, wait a bit
+                    logger.debug("No tasks available, waiting...")
                     time.sleep(1)
             except Exception as e:
-                print(f"Error in crawler main loop: {e}")
                 import traceback
-                print(traceback.format_exc())  # Print the full stack trace
+                logger.error(f"Error in crawler main loop: {e}")
+                logger.error(traceback.format_exc())  # Print the full stack trac
                 time.sleep(1)
     
     def stop(self):
@@ -257,6 +338,7 @@ class CrawlerNode:
     def _send_heartbeat(self):
         """Send a heartbeat to the master node."""
         heartbeat = {
+            'type': 'heartbeat',  # Add message type
             'crawler_id': self.crawler_id,
             'timestamp': time.time(),
             'status': 'active'
@@ -264,7 +346,7 @@ class CrawlerNode:
         
         try:
             self.sqs.send_message(
-                QueueUrl=self.crawl_result_queue_url,
+                QueueUrl=self.crawl_result_queue_url,  # Make sure this is the RESULT queue
                 MessageBody=json.dumps(heartbeat)
             )
         except Exception as e:
@@ -273,6 +355,7 @@ class CrawlerNode:
     def _get_task(self):
         """Get a task from the crawl task queue and update URL frontier."""
         try:
+            logger.debug(f"Attempting to receive message from queue: {self.crawl_task_queue_url}")
             response = self.sqs.receive_message(
                 QueueUrl=self.crawl_task_queue_url,
                 MaxNumberOfMessages=1,
@@ -283,7 +366,29 @@ class CrawlerNode:
                 message = response['Messages'][0]
                 task = json.loads(message['Body'])
                 
+                # Check message type - only process 'task' type messages
+                message_type = task.get('type', '')
+                if message_type == 'heartbeat':
+                    logger.warning(f"Received heartbeat message in task queue, deleting: {task}")
+                    self.sqs.delete_message(
+                        QueueUrl=self.crawl_task_queue_url,
+                        ReceiptHandle=message['ReceiptHandle']
+                    )
+                    return None
+                
+                # Validate task structure
+                if 'url' not in task:
+                    logger.error(f"Received malformed task without 'url' field: {task}")
+                    # Delete the invalid message from the queue
+                    self.sqs.delete_message(
+                        QueueUrl=self.crawl_task_queue_url,
+                        ReceiptHandle=message['ReceiptHandle']
+                    )
+                    logger.info("Deleted malformed task from queue")
+                    return None
+                
                 # Delete the message from the queue
+                logger.debug(f"Deleting message from queue: {message['MessageId']}")
                 self.sqs.delete_message(
                     QueueUrl=self.crawl_task_queue_url,
                     ReceiptHandle=message['ReceiptHandle']
@@ -292,16 +397,18 @@ class CrawlerNode:
                 # Update URL frontier in DynamoDB
                 try:
                     # First check if the table exists
+                    frontier_table = self.dynamodb.Table('url-frontier')
+                    
+                    # Ensure job_id is present in the task
+                    job_id = task.get('job_id')
+                    if not job_id:
+                        job_id = f"job-{uuid.uuid4()}"
+                        task['job_id'] = job_id
+                        logger.info(f"Generated new job_id: {job_id} for URL: {task['url']}")
+                    
+                    # Try to update the URL status
                     try:
-                        frontier_table = self.dynamodb.Table('url-frontier')
-                        
-                        # Ensure job_id is present in the task
-                        job_id = task.get('job_id')
-                        if not job_id:
-                            job_id = f"job-{uuid.uuid4()}"
-                            task['job_id'] = job_id
-                        
-                        # Try to update the URL status
+                        logger.debug(f"Updating URL frontier for URL: {task['url']}, job_id: {job_id}")
                         frontier_table.update_item(
                             Key={
                                 'url': task['url'],
@@ -316,35 +423,33 @@ class CrawlerNode:
                                 ':timestamp': datetime.now(timezone.utc).isoformat()
                             }
                         )
+                        logger.debug(f"Successfully updated URL frontier for URL: {task['url']}")
                     except Exception as e:
                         # If update fails, try to put the item instead
-                        if "ValidationException" in str(e):
-                            print(f"Trying to put item instead of update for URL: {task['url']}")
-                            # Ensure there's always a job_id
-                            job_id = task.get('job_id')
-                            if not job_id:
-                                job_id = f"job-{uuid.uuid4()}"
-                                task['job_id'] = job_id
-                    
-                    frontier_table.put_item(
-                        Item={
-                            'url': task['url'],
-                            'job_id': job_id,
-                            'status': 'in_progress',
-                            'last_crawled': datetime.now(timezone.utc).isoformat(),
-                            'depth': task.get('depth', 0),
-                            'crawler_id': self.crawler_id
-                        }
-                    )
+                        logger.warning(f"Failed to update URL frontier for URL: {task['url']}, error: {e}")
+                        logger.info(f"Trying to put item instead of update for URL: {task['url']}")
+                        frontier_table.put_item(
+                            Item={
+                                'url': task['url'],
+                                'job_id': job_id,
+                                'status': 'in_progress',
+                                'last_crawled': datetime.now(timezone.utc).isoformat(),
+                                'depth': task.get('depth', 0),
+                                'crawler_id': self.crawler_id
+                            }
+                        )
+                        logger.debug(f"Successfully put item in URL frontier for URL: {task['url']}")
                 except Exception as e:
-                    print(f"Error updating URL frontier: {e}")
+                    logger.error(f"Error updating URL frontier: {e}")
+                    logger.error(traceback.format_exc())
                 
-                print(f"Received task: {task['url']}")
+                logger.info(f"Received task: {task['url']} (depth: {task.get('depth', 0)}, job_id: {job_id})")
                 return task
             
             return None
         except Exception as e:
-            print(f"Error getting task: {e}")
+            logger.error(f"Error getting task: {e}")
+            logger.error(traceback.format_exc())
             return None
     
     def _process_task(self, task):
@@ -355,11 +460,12 @@ class CrawlerNode:
         depth = task.get('depth', 0)
         max_depth = task.get('max_depth', 3)
         
-        print(f"Processing URL: {url} (depth: {depth}/{max_depth})")
+        logger.info(f"Processing URL: {url} (task_id: {task_id}, depth: {depth}/{max_depth})")
         
         # Create a temporary directory for this crawl
         import tempfile
         temp_dir = tempfile.mkdtemp()
+        logger.debug(f"Created temporary directory: {temp_dir}")
         
         try:
             # Use CrawlerRunner instead of CrawlerProcess
@@ -369,178 +475,243 @@ class CrawlerNode:
             
             # Initialize crochet
             crochet.setup()
+            logger.debug("Crochet setup complete")
             
             # Create a new CrawlerRunner for each task with reduced logging
             self.settings.update({'LOG_LEVEL': 'ERROR'})  # Only show errors, not info messages
             runner = CrawlerRunner(self.settings)
+            logger.debug("CrawlerRunner created")
             
             # Define a callback to handle results after the crawl is complete
             def handle_spider_closed(spider):
+                logger.info(f"Spider closed for URL: {url}")
                 # Process the results from the spider
                 if hasattr(spider, 'results') and spider.results:
+                    logger.info(f"Spider returned {len(spider.results)} results")
                     for res in spider.results:
                         # Print only the parsed content
-                        print("\n--- PARSED CONTENT ---")
-                        print(f"URL: {res['url']}")
+                        logger.info(f"Processing result for URL: {res['url']}")
                         content = res['content']
-                        print(f"Title: {content.get('title', ['No title'])[0] if isinstance(content.get('title'), list) else content.get('title', 'No title')}")
-                        print(f"Description: {content.get('description', ['No description'])[0] if isinstance(content.get('description'), list) else content.get('description', 'No description')}")
-                        print(f"Keywords: {content.get('keywords', ['No keywords'])[0] if isinstance(content.get('keywords'), list) else content.get('keywords', 'No keywords')}")
-                        print(f"Language: {content.get('language', ['Not specified'])[0] if isinstance(content.get('language'), list) else content.get('language', 'Not specified')}")
-                        print(f"Content Type: {content.get('content_type', 'Unknown')}")
-                        print(f"Discovered URLs: {len(res['discovered_urls'])}")
-                        print("--------------------\n")
+                        title = content.get('title', ['No title'])[0] if isinstance(content.get('title'), list) else content.get('title', 'No title')
+                        logger.info(f"Title: {title}")
+                        logger.info(f"Discovered URLs: {len(res['discovered_urls'])}")
                         
                         # Send the result to the master
+                        logger.info(f"Sending result to master for URL: {res['url']}")
                         self._send_result(res, task)
+                else:
+                    logger.warning(f"Spider returned no results for URL: {url}")
             
             # Use crochet to run the crawl in a controlled way
+            logger.info(f"Starting spider for URL: {url}")
             @crochet.wait_for(timeout=180)
             def run_spider():
                 crawler = runner.create_crawler(WebSpider)
                 crawler.signals.connect(handle_spider_closed, signal=signals.spider_closed)
+                logger.debug(f"Spider signals connected for URL: {url}")
                 return runner.crawl(crawler, url=url, task_id=task_id, depth=depth)
             
             # Run the spider with crochet
             run_spider()
+            logger.info(f"Spider completed for URL: {url}")
             
         except Exception as e:
-            print(f"Error processing task: {e}")
-            import traceback
-            print(traceback.format_exc())
+            logger.error(f"Error processing task for URL {url}: {e}")
+            logger.error(traceback.format_exc())
+            
+            # Update URL frontier to mark as failed
+            try:
+                logger.info(f"Updating URL frontier to mark URL as failed: {url}")
+                self._update_url_frontier_after_failure(url, task, str(e))
+            except Exception as update_error:
+                logger.error(f"Error updating URL frontier after failure: {update_error}")
+                logger.error(traceback.format_exc())
+                
         finally:
             # Clean up the temporary directory
             import shutil
             try:
                 shutil.rmtree(temp_dir)
-            except:
-                pass
+                logger.debug(f"Cleaned up temporary directory: {temp_dir}")
+            except Exception as e:
+                logger.error(f"Error cleaning up temporary directory: {e}")
     
-    def _send_result(self, result, original_task):
-        """Send crawl results back to the master node and store in S3/DynamoDB."""
-        # Add crawler ID and original task parameters to the result
-        result['crawler_id'] = self.crawler_id
-        result['max_depth'] = original_task.get('max_depth', 3)
-        result['max_urls_per_domain'] = original_task.get('max_urls_per_domain', 100)
-        
-        # Store raw HTML content in S3
-        s3_client = boto3.client('s3')
-        s3_bucket = 'web-crawl-storage'
-        s3_raw_path = f"raw-content/{result['task_id']}/{uuid.uuid4()}.html"
-        
+    def _send_result(self, result, task):
+        """Send the crawl result to the master node."""
         try:
-            # Store the raw HTML in S3
-            if 'content' in result and 'html' in result['content']:
-                html_content = result['content']['html']
+            # Get the URL and job_id from the task
+            url = result.get('url')
+            job_id = task.get('job_id', 'unknown')
+            
+            logger.info(f"Preparing result for URL: {url}, job_id: {job_id}")
+            
+            # Store the content in S3
+            content = result.get('content', {})
+            content_key = None
+            if content:
+                # Create a unique key for the content
+                content_key = f"content/{job_id}/{uuid.uuid4()}.json"
                 
-                # Convert to string if it's a list or other type
-                if isinstance(html_content, list):
-                    html_content = ''.join(html_content)
-                elif not isinstance(html_content, str):
-                    html_content = str(html_content)
-                
-                s3_client.put_object(
-                    Bucket=s3_bucket,
-                    Key=s3_raw_path,
-                    Body=html_content,
-                    ContentType='text/html'
+                # Upload the content to S3
+                logger.info(f"Uploading content to S3 for URL: {url}, key: {content_key}")
+                self.s3.put_object(
+                    Bucket=CRAWL_DATA_BUCKET,
+                    Key=content_key,
+                    Body=json.dumps(content),
+                    ContentType='application/json'
                 )
+                logger.debug(f"Content uploaded to S3 for URL: {url}")
                 
-                # Update the result with S3 path
-                result['s3_raw_path'] = s3_raw_path
-                
-                # Remove the full HTML content which is likely causing the size issue
-                del result['content']['html']
-        except Exception as e:
-            print(f"Error storing content in S3: {e}")
-        
-        # Update DynamoDB with crawl metadata
-        try:
-            dynamodb = boto3.resource('dynamodb')
-            metadata_table = dynamodb.Table('crawl-metadata')
-            
-            # Get job_id from the original task or generate a new one
-            job_id = original_task.get('job_id', f"job-{uuid.uuid4()}")
-            
-            metadata_table.put_item(
-                Item={
-                    'url': result['url'],
-                    'job_id': job_id,  # Add the required job_id field
-                    'title': result['content'].get('title', ''),
-                    'description': result['content'].get('description', ''),
-                    'content_type': result['content'].get('content_type', ''),
-                    'language': result['content'].get('language', ''),
-                    'crawl_time': datetime.now(timezone.utc).isoformat(),
-                    's3_raw_path': s3_raw_path,
-                    'http_status': 200,  # Assuming success since we have content
-                    'crawler_id': self.crawler_id
-                }
-            )
-        except Exception as e:
-            print(f"Error updating DynamoDB: {e}")
-        
-        # Create a copy of the result to modify for sending
-        result_to_send = result.copy()
-        
-        # Send the message to SQS
-        message_body = json.dumps(result_to_send)
-        message_size = len(message_body.encode('utf-8'))
-        
-        # Truncate text content if it's too large
-        if 'content' in result_to_send and 'text' in result_to_send['content']:
-            text_content = result_to_send['content']['text']
-            if isinstance(text_content, list) and len(text_content) > 100:
-                # Keep only the first 100 text elements
-                result_to_send['content']['text'] = text_content[:100]
-                result_to_send['content']['text_truncated'] = True
-        
-        # Limit the number of discovered URLs if there are too many
-        if 'discovered_urls' in result_to_send and len(result_to_send['discovered_urls']) > 100:
-            result_to_send['discovered_urls'] = result_to_send['discovered_urls'][:100]
-            result_to_send['discovered_urls_truncated'] = True
-        
-        try:
-            # Convert to JSON and check size
-            message_body = json.dumps(result_to_send)
-            message_size = len(message_body.encode('utf-8'))
-            
-            # If still too large, take more drastic measures
-            if message_size > 250000:  # Leave some margin below the 262144 limit
-                print(f"Warning: Message size ({message_size} bytes) is still large. Taking additional measures.")
-                
-                # Keep only essential data
-                minimal_result = {
-                    'crawler_id': result_to_send['crawler_id'],
-                    'task_id': result_to_send['task_id'],
-                    'url': result_to_send['url'],
-                    'depth': result_to_send['depth'],
-                    'max_depth': result_to_send['max_depth'],
-                    'max_urls_per_domain': result_to_send['max_urls_per_domain'],
-                    'content': {
-                        'url': result_to_send['content'].get('url'),
-                        'title': result_to_send['content'].get('title'),
-                        'description': result_to_send['content'].get('description'),
+                # Add the content location to the metadata with job_id
+                logger.info(f"Updating crawl metadata for URL: {url}")
+                self.dynamodb.Table('crawl-metadata').put_item(
+                    Item={
+                        'url': url,
+                        'job_id': job_id,  # Include job_id in the key
+                        'content_location': content_key,
+                        'title': content.get('title', ''),
+                        'description': content.get('description', ''),
+                        'crawled_at': datetime.now(timezone.utc).isoformat(),
+                        'content_type': content.get('content_type', ''),
+                        'language': content.get('language', ''),
+                        'crawler_id': self.crawler_id
                     }
-                }
-                
-                # Include a subset of discovered URLs
-                if 'discovered_urls' in result_to_send:
-                    minimal_result['discovered_urls'] = result_to_send['discovered_urls'][:20]
-                    minimal_result['discovered_urls_truncated'] = True
-                
-                # Use the minimal result instead
-                message_body = json.dumps(minimal_result)
-                print(f"Reduced message size from {message_size} to {len(message_body.encode('utf-8'))} bytes")
+                )
+                logger.debug(f"Crawl metadata updated for URL: {url}")
             
-            # Send the message
+            # Prepare the result message
+            message = {
+                'type': 'result',
+                'crawler_id': self.crawler_id,
+                'task_id': result.get('task_id'),
+                'url': url,
+                'job_id': job_id,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'title': content.get('title', ''),
+                'discovered_urls': result.get('discovered_urls', []),
+                's3_key': content_key,
+                'depth': result.get('depth', 0)
+            }
+            
+            # Send the result to the master node
+            logger.info(f"Sending result to master for URL: {url}")
             self.sqs.send_message(
                 QueueUrl=self.crawl_result_queue_url,
-                MessageBody=message_body
+                MessageBody=json.dumps(message)
             )
-            print(f"Sent result for URL: {result['url']}")
+            logger.debug(f"Result sent to master for URL: {url}")
+            
+            # Update URL frontier to mark as completed
+            logger.info(f"Updating URL frontier to mark URL as completed: {url}")
+            self._update_url_frontier_after_completion(url, task)
+            
+            logger.info(f"Successfully processed and sent result for URL: {url}")
         except Exception as e:
-            print(f"Error sending result: {e}")
+            logger.error(f"Error sending result for URL {url}: {e}")
+            logger.error(traceback.format_exc())
+    def _update_url_frontier_after_completion(self, url, task):
+        """
+        Update the URL frontier after successfully completing a task.
+        
+        Args:
+            url (str): The URL that was crawled
+            task (dict): The task that was completed
+        """
+        try:
+            frontier_table = self.dynamodb.Table('url-frontier')
+            
+            job_id = task.get('job_id')
+            if not job_id:
+                job_id = f"job-{uuid.uuid4()}"
+                logger.warning(f"Missing job_id for completed URL: {url}, generated new one: {job_id}")
+            
+            update_expression = """
+                SET #status = :status, 
+                    completed_at = :completed_at, 
+                    crawler_id = :crawler_id,
+                    last_updated = :last_updated
+            """
+            
+            frontier_table.update_item(
+                Key={
+                    'url': url,
+                    'job_id': job_id
+                },
+                UpdateExpression=update_expression,
+                ExpressionAttributeNames={
+                    '#status': 'status'
+                },
+                ExpressionAttributeValues={
+                    ':status': 'completed',
+                    ':completed_at': datetime.now(timezone.utc).isoformat(),
+                    ':crawler_id': self.crawler_id,
+                    ':last_updated': datetime.now(timezone.utc).isoformat()
+                },
+                ReturnValues="ALL_NEW"
+            )
+            logger.info(f"Successfully updated URL frontier for completed URL: {url}")
+        except self.dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+            logger.error(f"Conditional check failed when updating URL {url}")
+            raise
+        except Exception as e:
+            logger.error(f"Error updating URL frontier for completed URL {url}: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
 
+    def _update_url_frontier_after_failure(self, url, task, error_message):
+        """
+        Update the URL frontier after failing to crawl a URL.
+        
+        Args:
+            url (str): The URL that failed to crawl
+            task (dict): The task that failed
+            error_message (str): The error message
+        """
+        try:
+            frontier_table = self.dynamodb.Table('url-frontier')
+            
+            job_id = task.get('job_id')
+            if not job_id:
+                job_id = f"job-{uuid.uuid4()}"
+                logger.warning(f"Missing job_id for failed URL: {url}, generated new one: {job_id}")
+            
+            update_expression = """
+                SET #status = :status,
+                    failed_at = :failed_at,
+                    error_message = :error_message,
+                    crawler_id = :crawler_id,
+                    retry_count = if_not_exists(retry_count, :zero) + :one,
+                    last_updated = :last_updated
+            """
+            
+            frontier_table.update_item(
+                Key={
+                    'url': url,
+                    'job_id': job_id
+                },
+                UpdateExpression=update_expression,
+                ExpressionAttributeNames={
+                    '#status': 'status'
+                },
+                ExpressionAttributeValues={
+                    ':status': 'failed',
+                    ':failed_at': datetime.now(timezone.utc).isoformat(),
+                    ':error_message': str(error_message)[:1024],  # Truncate long error messages
+                    ':crawler_id': self.crawler_id,
+                    ':zero': 0,
+                    ':one': 1,
+                    ':last_updated': datetime.now(timezone.utc).isoformat()
+                },
+                ReturnValues="ALL_NEW"
+            )
+            logger.info(f"Successfully updated URL frontier for failed URL: {url}")
+        except self.dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+            logger.error(f"Conditional check failed when updating URL {url}")
+            raise
+        except Exception as e:
+            logger.error(f"Error updating URL frontier for failed URL {url}: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
 
 if __name__ == "__main__":
     # Create and start a crawler node
@@ -594,3 +765,5 @@ if __name__ == "__main__":
             )
         except Exception as e_inner:
             print(f"Error updating URL frontier after failure: {e_inner}")
+    
+    

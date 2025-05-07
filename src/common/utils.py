@@ -2,6 +2,10 @@
 Utility functions for the distributed web crawling system.
 """
 from urllib.parse import urlparse, urlunparse
+import hashlib
+import re
+from urllib.robotparser import RobotFileParser
+
 
 def get_domain(url):
     """Extract the domain from a URL."""
@@ -10,6 +14,14 @@ def get_domain(url):
 
 def normalize_url(url):
     """Normalize a URL by removing fragments and trailing slashes."""
+    if not url:
+        return None
+        
+    # Add scheme if missing
+    if not url.startswith(('http://', 'https://')):
+        url = f"https://{url}"
+    
+    
     parsed = urlparse(url)
     
     # Remove fragment

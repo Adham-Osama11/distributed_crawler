@@ -269,6 +269,7 @@ class IndexerNode:
         
         # Counter for periodic saves
         self.processed_count = 0
+        self.document_count = 0  # Add this line to initialize document_count
         self.save_interval = 10  # Save after every 10 documents
         logger.info(f"Save interval set to: {self.save_interval} documents")
         
@@ -602,22 +603,7 @@ class IndexerNode:
         results = self.index.search(query, max_results)
         logger.info(f"Search returned {len(results)} results")
         return results
-
-
-if __name__ == "__main__":
-    # Create and start an indexer node
-    logger.info("Creating indexer node")
-    indexer = IndexerNode()
-    try:
-        indexer.start()
-    except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received, stopping indexer")
-        indexer.stop()
-    except Exception as e:
-        logger.critical(f"Unhandled exception in indexer: {e}")
-        logger.critical(traceback.format_exc())
-        indexer.stop()
-
+        
     def process_document(self, document):
         """Process a document and add it to the index.
         
@@ -648,86 +634,115 @@ if __name__ == "__main__":
             logger.error(f"Error processing document: {e}")
             logger.error(traceback.format_exc())
             return False
-
-def add_to_index(self, document):
-    """
-    Add a document to the search index.
+            
+    def _record_indexed_document(self, document):
+        """Record indexed document in DynamoDB for tracking purposes."""
+        logger.debug(f"Recording indexed document: {document.get('url', 'unknown')}")
+        try:
+            # Get the URL and timestamp
+            url = document.get('url', '')
+            timestamp = datetime.now(timezone.utc).isoformat()
+            
+            # Create or get the indexed-documents table
+            table = self.dynamodb.Table('indexed-documents')
+            
+            # Store the document metadata
+            table.put_item(
+                Item={
+                    'url': url,
+                    'indexer_id': self.indexer_id,
+                    'indexed_at': timestamp,
+                    'title': document.get('title', ''),
+                    'description': document.get('description', '')[:1000] if document.get('description') else '',
+                    'status': 'indexed'
+                }
+            )
+            logger.info(f"Successfully recorded indexed document: {url}")
+            return True
+        except Exception as e:
+            logger.error(f"Error recording indexed document: {e}")
+            logger.error(traceback.format_exc())
+            return False
+    def add_to_index(self, document):
+        """
+        Add a document to the search index.
+        
+        Args:
+            document (dict): Document to be indexed with fields like url, title, description, content
+            
+        Returns:
+            bool: True if indexing was successful, False otherwise
+        """
+        try:
+            # Extract fields from the document
+            url = document.get('url', '')
+            title = document.get('title', '')
+            description = document.get('description', '')
+            content = document.get('content', '')
+            
+            # Use the index's add_document method instead of directly manipulating the writer
+            success = self.index.add_document(url, {
+                'title': title,
+                'description': description,
+                'text': content  # Note: WhooshIndex expects 'text' field, not 'content'
+            })
+            
+            if success:
+                # Update the document count
+                self.document_count += 1
+                
+                # Check if we need to save the index to S3
+                if self.document_count % self.save_interval == 0:
+                    self._save_index_to_s3()
+                    
+                # Record the indexed document in DynamoDB
+                self._record_indexed_document(document)
+                
+                logger.info(f"Successfully indexed document: {url}")
+                return True
+                
+            else:
+             logger.error(f"Failed to index document: {url}")
+            return False
+                
+        except Exception as e:
+            logger.error(f"Error adding document to index: {e}")
+            logger.error(traceback.format_exc())
+            return False
     
-    Args:
-        document (dict): Document to be indexed with fields like url, title, description, content
+    def search_index(self, query_string, max_results=10):
+        """
+        Search the index for documents matching the query.
         
-    Returns:
-        bool: True if indexing was successful, False otherwise
-    """
-    try:
-        # Extract fields from the document
-        url = document.get('url', '')
-        title = document.get('title', '')
-        description = document.get('description', '')
-        content = document.get('content', '')
-        
-        # Create a writer for the index
-        writer = self.ix.writer()
-        
-        # Add the document to the index
-        writer.add_document(
-            url=url,
-            title=title,
-            description=description,
-            content=content,
-            indexed_at=datetime.now(timezone.utc).isoformat()
-        )
-        
-        # Commit the changes
-        writer.commit()
-        
-        # Update the document count
-        self.document_count += 1
-        
-        # Check if we need to save the index to S3
-        if self.document_count % self.save_interval == 0:
-            self._save_index_to_s3()
+        Args:
+            query_string (str): The search query
+            max_results (int): Maximum number of results to return
             
-        # Record the indexed document in DynamoDB
-        self._record_indexed_document(document)
-        
-        return True
-    except Exception as e:
-        logger.error(f"Error adding document to index: {e}")
-        return False
+        Returns:
+            list: List of matching documents
+        """
+        logger.info(f"Searching index for query: '{query_string}' (max results: {max_results})")
+       
+        try:
+        # Use the index's search method instead of directly accessing the searcher
+          results = self.index.search(query_string, max_results)
+          logger.info(f"Found {len(results)} matching documents")
+          return results
+        except Exception as e:
+          logger.error(f"Error searching index: {e}")
+          logger.error(traceback.format_exc())
+          return []
 
-def search_index(self, query_string, max_results=10):
-    """
-    Search the index for documents matching the query.
-    
-    Args:
-        query_string (str): The search query
-        max_results (int): Maximum number of results to return
-        
-    Returns:
-        list: List of matching documents
-    """
+if __name__ == "__main__":
+    # Create and start an indexer node
+    logger.info("Creating indexer node")
+    indexer = IndexerNode()
     try:
-        # Create a searcher
-        with self.ix.searcher() as searcher:
-            # Parse the query
-            query = QueryParser("content", self.ix.schema).parse(query_string)
-            
-            # Search the index
-            results = searcher.search(query, limit=max_results)
-            
-            # Format the results
-            formatted_results = []
-            for result in results:
-                formatted_results.append({
-                    'url': result['url'],
-                    'title': result['title'],
-                    'description': result['description'],
-                    'score': result.score,
-                    'indexed_at': result.get('indexed_at', '')
-                })
-            
-            return formatted_results
+        indexer.start()
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received, stopping indexer")
+        indexer.stop()
     except Exception as e:
-        logger.error(f"Error searching index: {e}")
-        return []
+        logger.critical(f"Unhandled exception in indexer: {e}")
+        logger.critical(traceback.format_exc())
+        indexer.stop()

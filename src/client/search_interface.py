@@ -262,10 +262,36 @@ def preprocess_query(query):
     # Remove extra whitespace
     query = ' '.join(query.split())
     
-    # You could add more preprocessing here:
-    # - Remove stop words
-    # - Apply stemming
-    # - Handle special characters
+    # Remove special characters
+    import re
+    query = re.sub(r'[^\w\s]', ' ', query)
+    
+    # Remove stop words
+    stop_words = {'a', 'an', 'the', 'and', 'or', 'but', 'is', 'are', 'in', 'on', 'at', 
+                 'to', 'for', 'with', 'by', 'about', 'as', 'of', 'from', 'this', 'that', 
+                 'these', 'those', 'it', 'its', 'they', 'them', 'their', 'we', 'us', 'our'}
+    
+    query_words = query.split()
+    filtered_words = [word for word in query_words if word not in stop_words]
+    
+    # If all words were stop words, keep the original query
+    if not filtered_words and query_words:
+        filtered_words = query_words
+    
+    # Apply stemming
+    try:
+        from nltk.stem import PorterStemmer
+        stemmer = PorterStemmer()
+        stemmed_words = [stemmer.stem(word) for word in filtered_words]
+        
+        # Combine original and stemmed words for better matching
+        # This preserves the original terms while also allowing for stemmed matches
+        combined_words = list(set(filtered_words + stemmed_words))
+        query = ' '.join(combined_words)
+    except ImportError:
+        # If NLTK is not available, just use the filtered words
+        query = ' '.join(filtered_words)
+        print("NLTK not available for stemming, using basic preprocessing only")
     
     return query
 
@@ -736,379 +762,6 @@ def suggest():
     except Exception as e:
         print(f"Error getting suggestions: {e}")
         return jsonify([])
-
-def get_table_count(table_name):
-    """Get the count of items in a DynamoDB table."""
-    try:
-        table = dynamodb.Table(table_name)
-        response = table.scan(Select='COUNT')
-        return response['Count']
-    except Exception as e:
-        print(f"Error getting count for table {table_name}: {e}")
-        # Re-raise the exception so the calling function can handle it
-        raise
-
-def get_active_crawlers():
-    """Get a list of active crawlers."""
-    try:
-        table = dynamodb.Table('crawler-status')
-        response = table.scan(
-            FilterExpression="#status = :status",
-            ExpressionAttributeNames={
-                '#status': 'status'
-            },
-            ExpressionAttributeValues={
-                ':status': 'active'
-            }
-        )
-        return response.get('Items', [])
-    except Exception as e:
-        print(f"Error getting active crawlers: {e}")
-        return []
-
-def perform_search(query):
-    """
-    Perform a search against the index with improved relevance scoring.
-    """
-    try:
-        # First, try to get the latest index metadata
-        index_metadata = get_latest_index_metadata()
-        
-        # Preprocess the query for better matching
-        processed_query = preprocess_query(query)
-        
-        results = []
-        if index_metadata:
-            # Use the S3-stored index for searching
-            results = search_using_s3_index(processed_query, index_metadata)
-        
-        # If no results from S3 index, try DynamoDB
-        if not results:
-            results = search_using_dynamodb(processed_query)
-            
-        # Apply additional ranking factors
-        results = apply_ranking_factors(results, processed_query)
-            
-        # If still no results, return a default "no results" message
-        if not results:
-            print("No results found for query: " + query)
-            # Create a dummy result to avoid "No results found" message
-            results = [{
-                'url': '#',
-                'title': 'No exact matches found',
-                'description': 'Try a different search term or submit a URL for crawling below.',
-                'indexed_at': datetime.now().isoformat(),
-                'score': 0
-            }]
-            
-        return results
-    except Exception as e:
-        print(f"Error performing search: {e}")
-        # Return a fallback result instead of empty list
-        return [{
-            'url': '#',
-            'title': 'Search Error',
-            'description': f'An error occurred while searching: {str(e)}',
-            'indexed_at': datetime.now().isoformat(),
-            'score': 0
-        }]
-
-def preprocess_query(query):
-    """Preprocess the query for better search results."""
-    # Convert to lowercase
-    query = query.lower()
-    
-    # Remove extra whitespace
-    query = ' '.join(query.split())
-    
-    # You could add more preprocessing here:
-    # - Remove stop words
-    # - Apply stemming
-    # - Handle special characters
-    
-    return query
-
-def apply_ranking_factors(results, query):
-    """Apply additional ranking factors to improve search relevance."""
-    query_terms = query.split()
-    
-    for result in results:
-        # Initialize additional score components
-        title_match_score = 0
-        freshness_score = 0
-        
-        # Boost exact title matches
-        if 'title' in result and result['title']:
-            title_lower = result['title'].lower()
-            if query in title_lower:
-                title_match_score += 5
-            
-            # Count term frequency in title
-            for term in query_terms:
-                if term in title_lower:
-                    title_match_score += 1
-        
-        # Boost fresher content if indexed_at is available
-        if 'indexed_at' in result and result['indexed_at'] and result['indexed_at'] != 'Unknown':
-            try:
-                indexed_time = datetime.fromisoformat(result['indexed_at'])
-                now = datetime.now()
-                if isinstance(indexed_time, datetime):
-                    # Content indexed within last day gets a boost
-                    age_in_days = (now - indexed_time).days
-                    if age_in_days < 1:
-                        freshness_score = 3
-                    elif age_in_days < 7:
-                        freshness_score = 2
-                    elif age_in_days < 30:
-                        freshness_score = 1
-            except (ValueError, TypeError):
-                pass
-        
-        # Apply the additional scores
-        result['score'] = result.get('score', 0) + title_match_score + freshness_score
-    
-    # Re-sort by the updated scores
-    results.sort(key=lambda x: x.get('score', 0), reverse=True)
-    
-    return results
-
-def get_latest_index_metadata():
-    """Get the latest index metadata from DynamoDB."""
-    try:
-        table = dynamodb.Table('index-metadata')
-        
-        # First get all indexer_ids
-        response = table.scan(
-            ProjectionExpression="indexer_id",
-            Select="SPECIFIC_ATTRIBUTES"
-        )
-        
-        if not response.get('Items'):
-            return None
-            
-        # Get the most recent indexer_id (you might want to implement a better strategy)
-        indexer_ids = set(item['indexer_id'] for item in response['Items'])
-        if not indexer_ids:
-            return None
-            
-        # Just use the first indexer_id for simplicity
-        indexer_id = next(iter(indexer_ids))
-        
-        # Now query for the latest item with this indexer_id
-        query_response = table.query(
-            KeyConditionExpression="indexer_id = :id",
-            ExpressionAttributeValues={
-                ":id": indexer_id
-            },
-            Limit=1,
-            ScanIndexForward=False  # This is valid for query operations
-        )
-        
-        if query_response.get('Items'):
-            return query_response['Items'][0]
-        return None
-    except Exception as e:
-        print(f"Error getting latest index metadata: {e}")
-        return None
-
-def search_using_s3_index(query, index_metadata):
-    """Search using the index stored in S3."""
-    try:
-        # Get the index and documents from S3
-        index_key = index_metadata.get('index_key')
-        documents_key = index_metadata.get('documents_key')
-        
-        if not index_key or not documents_key:
-            return []
-        
-        # Load the index from S3
-        index_response = s3.get_object(Bucket=INDEX_DATA_BUCKET, Key=index_key)
-        index_data = json.loads(index_response['Body'].read().decode('utf-8'))
-        
-        # Load the documents from S3
-        documents_response = s3.get_object(Bucket=INDEX_DATA_BUCKET, Key=documents_key)
-        documents_data = json.loads(documents_response['Body'].read().decode('utf-8'))
-        
-        # If no documents, return empty results
-        if not documents_data:
-            print("No documents found in the index")
-            return []
-            
-        # Tokenize the query
-        query_terms = [term.lower() for term in query.split() if term.strip()]
-        
-        # Calculate scores (simple term frequency)
-        scores = {}
-        for term in query_terms:
-            if term in index_data:
-                for url, count in index_data[term].items():
-                    if url not in scores:
-                        scores[url] = 0
-                    scores[url] += count
-        
-        # If no matches found, return some default results
-        if not scores:
-            print("No matches found for query terms, returning default results")
-            # Return the first 5 documents as default results
-            default_urls = list(documents_data.keys())[:5]
-            for url in default_urls:
-                scores[url] = 1  # Give them all the same score
-        
-        # Sort by score
-        results = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:10]
-        
-        # Format results
-        formatted_results = []
-        for url, score in results:
-            if url in documents_data:
-                # Get additional metadata from DynamoDB if available
-                metadata = get_url_metadata(url)
-                
-                result = {
-                    'url': url,
-                    'title': documents_data[url].get('title', 'No title'),
-                    'score': score
-                }
-                
-                # Add metadata if available
-                if metadata:
-                    result.update({
-                        'description': metadata.get('description', 'No description available'),
-                        'indexed_at': metadata.get('indexed_at', 'Unknown')
-                    })
-                else:
-                    result['description'] = documents_data[url].get('description', 'No description available')
-                
-                formatted_results.append(result)
-        
-        return formatted_results
-    except Exception as e:
-        print(f"Error searching using S3 index: {e}")
-        return []
-
-def search_using_dynamodb(query):
-    """Search directly using DynamoDB (fallback method)."""
-    try:
-        # Tokenize the query for better matching
-        query_terms = [term.lower() for term in query.split() if term.strip()]
-        if not query_terms:
-            return []
-            
-        results = []
-        
-        # First try the indexed-documents table
-        try:
-            table = dynamodb.Table('indexed-documents')
-            
-            # Scan the table for potential matches
-            response = table.scan(
-                Limit=50  # Increase limit to get more potential matches
-            )
-            
-            for item in response.get('Items', []):
-                # Calculate a more sophisticated score
-                score = 0
-                title = item.get('title', '').lower()
-                description = item.get('description', '').lower()
-                
-                # Check for exact matches first
-                if query.lower() in title:
-                    score += 10
-                if query.lower() in description:
-                    score += 5
-                    
-                # Then check for individual term matches
-                for term in query_terms:
-                    if term in title:
-                        score += 3
-                    if term in description:
-                        score += 1
-                
-                # Only include results with a positive score
-                if score > 0:
-                    results.append({
-                        'url': item['url'],
-                        'title': item.get('title', 'No title'),
-                        'description': item.get('description', 'No description available'),
-                        'indexed_at': item.get('indexed_at', 'Unknown'),
-                        'score': score
-                    })
-            
-            # If we have enough results, return them
-            if len(results) >= 5:
-                results.sort(key=lambda x: x['score'], reverse=True)
-                return results[:10]  # Return top 10 results
-                
-        except Exception as e:
-            print(f"Error searching indexed-documents: {e}")
-        
-        # If no results or error, try crawl-metadata table
-        try:
-            table = dynamodb.Table('crawl-metadata')
-            
-            # Scan the table for potential matches
-            response = table.scan(
-                Limit=50  # Increase limit to get more potential matches
-            )
-            
-            for item in response.get('Items', []):
-                # Calculate a more sophisticated score
-                score = 0
-                title = item.get('title', '').lower()
-                description = item.get('description', '').lower()
-                
-                # Check for exact matches first
-                if query.lower() in title:
-                    score += 10
-                if query.lower() in description:
-                    score += 5
-                    
-                # Then check for individual term matches
-                for term in query_terms:
-                    if term in title:
-                        score += 3
-                    if term in description:
-                        score += 1
-                
-                # Only include results with a positive score
-                if score > 0:
-                    results.append({
-                        'url': item['url'],
-                        'title': item.get('title', 'No title'),
-                        'description': item.get('description', 'No description available'),
-                        'indexed_at': item.get('crawl_time', 'Unknown'),
-                        'score': score
-                    })
-            
-        except Exception as e:
-            print(f"Error searching crawl-metadata: {e}")
-        
-        # Sort by score and return top results
-        if results:
-            results.sort(key=lambda x: x['score'], reverse=True)
-            return results[:10]  # Return top 10 results
-            
-        # If all else fails, return empty results
-        return []
-    except Exception as e:
-        print(f"Error searching using DynamoDB: {e}")
-        return []
-
-def get_url_metadata(url):
-    """Get metadata for a URL from DynamoDB."""
-    try:
-        table = dynamodb.Table('crawl-metadata')
-        response = table.get_item(
-            Key={'url': url}
-        )
-        
-        if 'Item' in response:
-            return response['Item']
-        return None
-    except Exception as e:
-        print(f"Error getting URL metadata: {e}")
-        return None
 
 @app.route('/debug-info', endpoint='debug_system_v2')
 def debug_system():

@@ -658,20 +658,19 @@ class MasterNode:
         
         while True:
             try:
-                # Process crawl results
-                self.process_crawl_results()
-                
                 # Process commands from clients
                 self.process_commands()
-                
+                # Process crawl results
+                self.process_crawl_results()
                 # Sleep briefly to avoid CPU spinning
                 time.sleep(0.1)
             except KeyboardInterrupt:
-                print("Master node shutting down...")
-                break
+               logger.info("Received keyboard interrupt, shutting down...")
+               break
             except Exception as e:
-                print(f"Error in master node main loop: {e}")
-                time.sleep(1)
+               logger.error(f"Error in main loop: {e}")
+               logger.error(traceback.format_exc())
+               time.sleep(1)  # Sleep longer on error
 
 def process_client_requests(self):
     """Process client requests from the task queue."""
@@ -787,15 +786,14 @@ def start(self):
     # Main processing loop
     while True:
         try:
+            # Process direct commands from clients
+            self.process_master_commands()
+
             # Process crawl results
             self.process_crawl_results()
 
             # Process client requests
             self.process_client_requests()
-
-            # Process direct commands from clients
-            self.process_master_commands()
-
             # Sleep briefly to avoid tight looping
             time.sleep(1)
         except Exception as e:
@@ -809,7 +807,7 @@ def process_master_commands(self):
         response = self.sqs.receive_message(
             QueueUrl=self.master_command_queue_url,
             MaxNumberOfMessages=10,
-            WaitTimeSeconds=1
+            WaitTimeSeconds=5
         )
         
         if 'Messages' not in response:
@@ -835,17 +833,17 @@ def process_master_commands(self):
                             crawl_id=str(uuid.uuid4())
                         )
                 # Handle command format from submit_url.py
-                elif command.get('type') == 'crawl_url':
-                    url = command.get('url')
-                    if url:
-                        print(f"Received URL from client: {url}")
-                        self._enqueue_url(
-                            url=url,
-                            depth=0,
-                            max_depth=command.get('max_depth', 3),
-                            max_urls_per_domain=command.get('max_urls_per_domain', 100),
-                            crawl_id=str(uuid.uuid4())
-                        )
+                elif command.get('type') == 'start_crawl':
+                    seed_urls = command.get('seed_urls', [])
+                    max_depth = command.get('max_depth', 3)
+                    max_urls_per_domain = command.get('max_urls_per_domain', 100)
+                    
+                    if seed_urls:
+                        logger.info(f"Received start_crawl command with {len(seed_urls)} seed URLs")
+                        crawl_id = self.start_crawl(seed_urls, max_depth, max_urls_per_domain)
+                        logger.info(f"Started crawl with ID: {crawl_id}")
+                    else:
+                        logger.warning("Received start_crawl command with no seed URLs")
                 # Handle command format from dashboard
                 elif command.get('command') == 'start_crawl':
                     seed_urls = command.get('seed_urls', [])
@@ -873,9 +871,11 @@ def process_master_commands(self):
                     ReceiptHandle=message['ReceiptHandle']
                 )
             except Exception as e:
-                print(f"Error processing master command: {e}")
+                logger.error(f"Error processing command: {e}")
+                logger.error(traceback.format_exc())
     except Exception as e:
-        print(f"Error receiving master commands: {e}")
+        logger.error(f"Error receiving commands: {e}")
+        logger.error(traceback.format_exc())
 
 def receive_client_url(self, url, max_depth=3, max_urls_per_domain=100):
     """

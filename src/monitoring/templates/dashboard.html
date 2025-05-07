@@ -679,7 +679,8 @@
                         const urlText = document.getElementById('url-list').value;
                         if (urlText.trim() === '') return;
                         
-                        const urls = urlText.split('\n').filter(url => url.trim() !== '');
+                        const urls = urlText.split('
+').filter(url => url.trim() !== '');
                         const maxDepth = parseInt(document.getElementById('max-depth').value);
                         const maxUrls = parseInt(document.getElementById('max-urls').value);
                         

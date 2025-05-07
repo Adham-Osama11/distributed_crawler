@@ -56,6 +56,8 @@ class WebSpider(scrapy.Spider):
     
     def __init__(self, url=None, task_id=None, depth=0, *args, **kwargs):
         super(WebSpider, self).__init__(*args, **kwargs)
+        
+        # Set start_urls only if we have a valid URL
         self.start_urls = [url] if url else []
         self.task_id = task_id
         self.depth = depth
@@ -66,7 +68,7 @@ class WebSpider(scrapy.Spider):
         try:
             # Use ItemLoader for better data extraction
             # Pass the response object as the selector
-            loader = ItemLoader(item=WebPage(), selector=response)
+            loader = ItemLoader(item=WebPage(), response=response)
             
             # Extract metadata
             loader.add_value('url', response.url)
@@ -451,6 +453,7 @@ class CrawlerNode:
             logger.error(f"Error getting task: {e}")
             logger.error(traceback.format_exc())
             return None
+            
     
     def _process_task(self, task):
         """Process a crawl task using Scrapy."""
@@ -460,6 +463,21 @@ class CrawlerNode:
         depth = task.get('depth', 0)
         max_depth = task.get('max_depth', 3)
         
+        # Validate URL - ensure it has a scheme and correct typos
+        if not url:
+            logger.error("Empty URL provided in task")
+            self._report_crawl_result(task_id, None, [], "error", "Empty URL provided")
+            return
+        
+        # Validate and correct URL
+        url = self._validate_url(url)
+        if not url:
+            logger.error("Invalid URL provided in task")
+            self._report_crawl_result(task_id, None, [], "error", "Invalid URL provided")
+            return
+        
+        # Update the task URL
+        task['url'] = url
         logger.info(f"Processing URL: {url} (task_id: {task_id}, depth: {depth}/{max_depth})")
         
         # Create a temporary directory for this crawl
@@ -535,7 +553,36 @@ class CrawlerNode:
                 logger.debug(f"Cleaned up temporary directory: {temp_dir}")
             except Exception as e:
                 logger.error(f"Error cleaning up temporary directory: {e}")
-    
+
+    def _validate_url(self, url):
+            """Ensure URL has a proper scheme and correct common typos."""
+            if not url:
+                return None
+                
+            # Add scheme if missing
+            if not url.startswith(('http://', 'https://')):
+                logger.warning(f"URL missing scheme, adding https://: {url}")
+                url = f"https://{url}"
+            
+            # Correct common typos
+            common_typos = {
+                'meduim.com': 'medium.com',
+                'gogle.com': 'google.com',
+                'facbook.com': 'facebook.com',
+                'amazn.com': 'amazon.com',
+                'wikipdia.org': 'wikipedia.org'
+            }
+            
+            for typo, correction in common_typos.items():
+                if typo in url:
+                    corrected_url = url.replace(typo, correction)
+                    logger.warning(f"Corrected URL typo: {url} -> {corrected_url}")
+                    url = corrected_url
+            
+            return url
+            # Update the task URL
+            task['url'] = url
+        
     def _send_result(self, result, task):
         """Send the crawl result to the master node."""
         try:
@@ -731,7 +778,7 @@ if __name__ == "__main__":
             
             # Update the URL status to completed
             frontier_table.update_item(
-                Key={'url':    task['url'],
+                Key={'url':task['url'],
                      'job_id': task['job_id']
                 },
                 UpdateExpression="SET #status = :status, last_crawled = :timestamp",
@@ -753,7 +800,7 @@ if __name__ == "__main__":
             
             # Update the URL status to failed
             frontier_table.update_item(
-                Key={'url': task['url']},
+                Key={'url':task['url']},
                 UpdateExpression="SET #status = :status, last_crawled = :timestamp",
                 ExpressionAttributeNames={
                     '#status': 'status'
@@ -765,5 +812,3 @@ if __name__ == "__main__":
             )
         except Exception as e_inner:
             print(f"Error updating URL frontier after failure: {e_inner}")
-    
-    

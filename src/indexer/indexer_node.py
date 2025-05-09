@@ -14,10 +14,30 @@ import threading
 import uuid
 from datetime import datetime, timezone
 import shutil
+import re
+from bs4 import BeautifulSoup
 from whoosh.index import create_in, open_dir
-from whoosh.fields import Schema, TEXT, ID, STORED
-from whoosh.qparser import QueryParser, MultifieldParser
-from whoosh.analysis import StemmingAnalyzer
+from whoosh.fields import Schema, TEXT, ID, STORED, DATETIME
+from whoosh.qparser import QueryParser, MultifieldParser, FuzzyTermPlugin, PhrasePlugin, WildcardPlugin
+from whoosh.analysis import StemmingAnalyzer, StandardAnalyzer
+from whoosh.scoring import BM25F
+from whoosh.highlight import HtmlFormatter, ContextFragmenter
+import nltk
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+from nltk.stem import PorterStemmer
+from nltk.probability import FreqDist
+from decimal import Decimal
+
+# Download required NLTK data
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
 
 # Add the parent directory to the path so we can import common modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -34,25 +54,58 @@ logging.basicConfig(
 )
 logger = logging.getLogger("indexer")
 
+class EnhancedTextProcessor:
+    """Enhanced text processing with NLTK."""
+    def __init__(self):
+        self.stemmer = PorterStemmer()
+        self.stop_words = set(stopwords.words('english'))
+        logger.info("Initialized EnhancedTextProcessor")
+    
+    def process_text(self, text):
+        """Process text with NLTK."""
+        if not text:
+            return '', []
+        
+        # Tokenize
+        tokens = word_tokenize(text.lower())
+        
+        # Remove stopwords and stem
+        processed_tokens = [
+            self.stemmer.stem(token)
+            for token in tokens
+            if token.isalnum() and token not in self.stop_words
+        ]
+        
+        # Get keyword frequencies
+        fdist = FreqDist(processed_tokens)
+        keywords = [word for word, freq in fdist.most_common(10)]
+        
+        return ' '.join(processed_tokens), keywords
+
 class WhooshIndex:
-    """A more robust index using Whoosh library."""
+    """A more robust index using Whoosh library with enhanced features."""
     def __init__(self, index_dir='whoosh_index'):
         # Create index directory if it doesn't exist
         self.index_dir = index_dir
         os.makedirs(self.index_dir, exist_ok=True)
         logger.info(f"Index directory initialized: {self.index_dir}")
         
-        # Define schema with stemming analyzer for better text processing
+        # Initialize text processor
+        self.text_processor = EnhancedTextProcessor()
+        
+        # Define schema with enhanced fields
         self.schema = Schema(
             url=ID(stored=True, unique=True),
-            title=TEXT(stored=True),
-            description=TEXT(stored=True),
+            title=TEXT(stored=True, analyzer=StemmingAnalyzer()),
+            description=TEXT(stored=True, analyzer=StemmingAnalyzer()),
             content=TEXT(analyzer=StemmingAnalyzer(), stored=True),
             keywords=TEXT(stored=True),
             domain=STORED,
-            crawl_time=STORED
+            crawl_time=DATETIME(stored=True),
+            processed_text=TEXT(analyzer=StemmingAnalyzer(), stored=True),
+            metadata=STORED
         )
-        logger.debug("Schema defined with fields: url, title, description, content, keywords, domain, crawl_time")
+        logger.debug("Schema defined with enhanced fields")
         
         # Create or open the index
         if not os.listdir(self.index_dir):
@@ -66,79 +119,156 @@ class WhooshIndex:
         self.lock = threading.Lock()
         logger.debug("Index initialization complete")
     
+    def _extract_text_from_html(self, html_content):
+        """Extract and clean text from HTML content."""
+        if not html_content:
+            return ''
+        
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # Remove script and style elements
+            for script in soup(["script", "style"]):
+                script.decompose()
+            
+            # Get text
+            text = soup.get_text()
+            
+            # Break into lines and remove leading and trailing space
+            lines = (line.strip() for line in text.splitlines())
+            # Break multi-headlines into a line each
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            # Drop blank lines
+            text = '\n'.join(chunk for chunk in chunks if chunk)
+            
+            return text
+        except Exception as e:
+            logger.error(f"Error extracting text from HTML: {e}")
+            return html_content
+    
+    def _extract_field(self, content, field_name):
+        """Extract and normalize a field from content with enhanced processing."""
+        value = content.get(field_name, '')
+        
+        # Handle case where field is a list
+        if isinstance(value, list):
+            value = ' '.join([str(item) for item in value if item])
+        
+        # If it's HTML content, extract text
+        if field_name in ['content', 'text'] and value:
+            value = self._extract_text_from_html(value)
+        
+        # Process text with NLTK
+        if value and field_name in ['content', 'text', 'title', 'description']:
+            processed_text, keywords = self.text_processor.process_text(value)
+            if field_name == 'content':
+                content['keywords'] = keywords
+            return processed_text
+        
+        return value or ''
+    
     def add_document(self, url, content):
-        """Add a document to the index."""
+        """Add a document to the index with enhanced processing."""
         logger.debug(f"Adding document to index: {url}")
         with self.lock:
-            # Extract content
-            title = self._extract_field(content, 'title')
-            description = self._extract_field(content, 'description')
-            text = self._extract_field(content, 'text')
-            keywords = self._extract_field(content, 'keywords')
-            
-            # Extract domain from URL
-            domain = url.split('/')[2] if '://' in url else url.split('/')[0]
-            logger.debug(f"Extracted domain: {domain}")
-            
-            # Add document to index
-            writer = self.ix.writer()
             try:
-                logger.debug(f"Writing document to index: {url}")
-                writer.update_document(
-                    url=url,
-                    title=title,
-                    description=description,
-                    content=text,
-                    keywords=keywords,
-                    domain=domain,
-                    crawl_time=datetime.now(timezone.utc).isoformat()
-                )
+                # Extract and process content
+                title = self._extract_field(content, 'title')
+                description = self._extract_field(content, 'description')
+                text = self._extract_field(content, 'text')
+                keywords = content.get('keywords', [])
+                
+                # Extract domain from URL
+                domain = url.split('/')[2] if '://' in url else url.split('/')[0]
+                
+                # Add document to index
+                writer = self.ix.writer()
+                
+                # Check if the schema has the processed_text field
+                has_processed_text = 'processed_text' in self.ix.schema.names()
+                
+                # Create document with available fields
+                doc = {
+                    'url': url,
+                    'title': title,
+                    'description': description,
+                    'content': text,
+                    'keywords': ' '.join(keywords),
+                    'domain': domain,
+                    'crawl_time': datetime.now(timezone.utc),
+                }
+                
+                # Only add processed_text if the schema supports it
+                if has_processed_text:
+                    doc['processed_text'] = text
+                    
+                writer.update_document(**doc)
                 writer.commit()
                 logger.info(f"Successfully indexed document: {url}")
                 return True
             except Exception as e:
-                writer.cancel()
+                if hasattr(writer, 'cancel'):
+                    writer.cancel()
                 logger.error(f"Error indexing document {url}: {e}")
                 logger.error(traceback.format_exc())
                 return False
     
-    def _extract_field(self, content, field_name):
-        """Extract and normalize a field from content."""
-        value = content.get(field_name, '')
-        
-        # Handle case where field is a list (from crawler output)
-        if isinstance(value, list):
-            value = ' '.join([str(item) for item in value if item])
-            logger.debug(f"Converted list field '{field_name}' to string, length: {len(value)}")
-        
-        return value or ''
-    
-    def search(self, query_string, max_results=10):
-        """Search the index with more advanced query capabilities."""
+    def search(self, query_string, max_results=10, highlight=True):
+        """Enhanced search with advanced query capabilities."""
         logger.info(f"Searching index for: '{query_string}' (max results: {max_results})")
         with self.lock:
             with self.ix.searcher() as searcher:
-                # Create a parser that searches multiple fields
-                parser = MultifieldParser(["title", "content", "description", "keywords"], 
-                                         schema=self.ix.schema)
+                # Create a parser with plugins for advanced search
+                parser = MultifieldParser(
+                    ["title", "content", "description", "keywords"],
+                    schema=self.ix.schema
+                )
+                parser.add_plugin(FuzzyTermPlugin())
+                parser.add_plugin(PhrasePlugin())
+                parser.add_plugin(WildcardPlugin())
                 
                 # Parse the query
                 query = parser.parse(query_string)
                 logger.debug(f"Parsed query: {query}")
                 
-                # Search
-                results = searcher.search(query, limit=max_results)
-                logger.info(f"Search returned {len(results)} results")
+                # Search with BM25F scoring
+                results = searcher.search(
+                    query,
+                    limit=max_results,
+                    scored=True,
+                    terms=True
+                )
+                
+                # Configure highlighting
+                if highlight:
+                    formatter = HtmlFormatter(tagname='span', classname='highlight')
+                    fragmenter = ContextFragmenter(maxchars=150, surround=50)
+                    results.fragmenter = fragmenter
+                    results.formatter = formatter
                 
                 # Format results
                 formatted_results = []
                 for hit in results:
-                    formatted_results.append({
+                    result = {
                         'url': hit['url'],
                         'title': hit['title'],
                         'description': hit.get('description', ''),
-                        'score': hit.score
-                    })
+                        'score': hit.score,
+                        'highlights': []
+                    }
+                    
+                    # Add highlights if available
+                    if highlight:
+                        for field in ['title', 'content', 'description']:
+                            if field in hit:
+                                highlights = hit.highlights(field)
+                                if highlights:
+                                    result['highlights'].append({
+                                        'field': field,
+                                        'text': highlights
+                                    })
+                    
+                    formatted_results.append(result)
                     logger.debug(f"Result: {hit['url']} (score: {hit.score})")
                 
                 return formatted_results
@@ -240,6 +370,14 @@ class IndexerNode:
         self.s3 = boto3.client('s3', region_name='us-east-1')
         self.dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
         
+        # Fault tolerance settings
+        self.heartbeat_interval = 30  # seconds
+        self.task_timeout = 300  # 5 minutes
+        self.max_retries = 3
+        self.recovery_interval = 60  # seconds
+        self.last_heartbeat = time.time()
+        self.failed_tasks = defaultdict(int)  # Track failed tasks and retry counts
+        
         # Get queue URL
         try:
             logger.debug(f"Getting queue URL for: {INDEX_TASK_QUEUE}")
@@ -269,7 +407,7 @@ class IndexerNode:
         
         # Counter for periodic saves
         self.processed_count = 0
-        self.document_count = 0  # Add this line to initialize document_count
+        self.document_count = 0
         self.save_interval = 10  # Save after every 10 documents
         logger.info(f"Save interval set to: {self.save_interval} documents")
         
@@ -281,6 +419,11 @@ class IndexerNode:
         logger.debug("Setting up heartbeat thread")
         self.heartbeat_thread = threading.Thread(target=self._send_heartbeats)
         self.heartbeat_thread.daemon = True
+        
+        # Recovery thread for handling failed tasks
+        logger.debug("Setting up recovery thread")
+        self.recovery_thread = threading.Thread(target=self._recovery_loop)
+        self.recovery_thread.daemon = True
         
         logger.info("Indexer node initialization complete")
     
@@ -427,23 +570,329 @@ class IndexerNode:
                 time.sleep(5)  # Shorter retry interval on error
     
     def _send_heartbeat(self):
-        """Send a heartbeat to DynamoDB."""
+        """Send a heartbeat to DynamoDB with enhanced status information."""
         logger.debug("Sending heartbeat")
         try:
             timestamp = datetime.now(timezone.utc).isoformat()
-            self.dynamodb.Table('indexer-status').put_item(
-                Item={
-                    'indexer_id': self.indexer_id,
-                    'timestamp': timestamp,
-                    'status': 'active',
-                    'processed_count': self.processed_count
-                }
-            )
-            logger.debug(f"Heartbeat sent at {timestamp}, processed count: {self.processed_count}")
+            status = {
+                'indexer_id': self.indexer_id,
+                'timestamp': timestamp,
+                'status': 'active',
+                'processed_count': Decimal(str(self.processed_count)),
+                'document_count': Decimal(str(self.document_count)),
+                'failed_tasks': Decimal(str(len(self.failed_tasks))),
+                'last_successful_task': self.last_successful_task if hasattr(self, 'last_successful_task') else None,
+                'memory_usage': Decimal(str(self._get_memory_usage())),
+                'index_size': Decimal(str(self._get_index_size()))
+            }
+            self.dynamodb.Table('indexer-status').put_item(Item=status)
+            self.last_heartbeat = time.time()
+            logger.debug(f"Heartbeat sent at {timestamp}, status: {status}")
         except Exception as e:
             logger.error(f"Error sending heartbeat: {e}")
             logger.error(traceback.format_exc())
-    
+
+    def _get_memory_usage(self):
+        """Get current memory usage of the process."""
+        try:
+            import psutil
+            process = psutil.Process()
+            return process.memory_info().rss / 1024 / 1024  # Convert to MB
+        except:
+            return 0
+
+    def _get_index_size(self):
+        """Get the size of the index directory."""
+        try:
+            total_size = 0
+            for dirpath, dirnames, filenames in os.walk(self.index.index_dir):
+                for f in filenames:
+                    fp = os.path.join(dirpath, f)
+                    total_size += os.path.getsize(fp)
+            return total_size / 1024 / 1024  # Convert to MB
+        except:
+            return 0
+
+    def _recovery_loop(self):
+        """Recovery thread that handles failed tasks and system recovery."""
+        logger.info("Starting recovery loop")
+        while self.running:
+            try:
+                # Check for failed tasks that need retrying
+                self._retry_failed_tasks()
+                
+                # Check for system health
+                self._check_system_health()
+                
+                # Attempt to recover from any failures
+                self._attempt_recovery()
+                
+                time.sleep(self.recovery_interval)
+            except Exception as e:
+                logger.error(f"Error in recovery loop: {e}")
+                logger.error(traceback.format_exc())
+                time.sleep(5)
+
+    def _retry_failed_tasks(self):
+        """Retry failed tasks that haven't exceeded max retries."""
+        logger.debug("Checking for failed tasks to retry")
+        tasks_to_retry = []
+        
+        # Get tasks that haven't exceeded max retries
+        for task_id, retry_count in self.failed_tasks.items():
+            if retry_count < self.max_retries:
+                tasks_to_retry.append(task_id)
+        
+        if tasks_to_retry:
+            logger.info(f"Retrying {len(tasks_to_retry)} failed tasks")
+            for task_id in tasks_to_retry:
+                try:
+                    # Get task from DynamoDB
+                    response = self.dynamodb.Table('failed-tasks').get_item(
+                        Key={'task_id': task_id}
+                    )
+                    if 'Item' in response:
+                        task = response['Item']
+                        # Re-queue the task
+                        self._requeue_task(task)
+                        # Update retry count
+                        self.failed_tasks[task_id] += 1
+                        logger.info(f"Re-queued task {task_id}, retry count: {self.failed_tasks[task_id]}")
+                except Exception as e:
+                    logger.error(f"Error retrying task {task_id}: {e}")
+                    logger.error(traceback.format_exc())
+
+    def _check_system_health(self):
+        """Check system health and take corrective actions if needed."""
+        try:
+            # Check if we're receiving heartbeats
+            if time.time() - self.last_heartbeat > self.heartbeat_interval * 2:
+                logger.warning("No recent heartbeats, attempting recovery")
+                self._attempt_recovery()
+            
+            # Check memory usage
+            memory_usage = self._get_memory_usage()
+            if memory_usage > 1000:  # More than 1GB
+                logger.warning(f"High memory usage: {memory_usage}MB")
+                self._handle_high_memory_usage()
+            
+            # Check index size
+            index_size = self._get_index_size()
+            if index_size > 1000:  # More than 1GB
+                logger.warning(f"Large index size: {index_size}MB")
+                self._handle_large_index()
+                
+        except Exception as e:
+            logger.error(f"Error checking system health: {e}")
+            logger.error(traceback.format_exc())
+
+    def _attempt_recovery(self):
+        """Attempt to recover from failures."""
+        try:
+            # Save current state
+            self._save_state()
+            
+            # Reload index from S3 if needed
+            if not self._verify_index_integrity():
+                logger.warning("Index integrity check failed, reloading from S3")
+                self._reload_index_from_s3()
+            
+            # Reset failed tasks if they've exceeded max retries
+            self._cleanup_failed_tasks()
+            
+            logger.info("Recovery attempt completed")
+        except Exception as e:
+            logger.error(f"Error during recovery: {e}")
+            logger.error(traceback.format_exc())
+
+    def _save_state(self):
+        """Save current state to S3 for recovery."""
+        try:
+            state = {
+                'indexer_id': self.indexer_id,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'processed_count': self.processed_count,
+                'document_count': self.document_count,
+                'failed_tasks': dict(self.failed_tasks)
+            }
+            
+            # Save to S3
+            self.s3.put_object(
+                Bucket=INDEX_DATA_BUCKET,
+                Key=f"indexer-state/{self.indexer_id}.json",
+                Body=json.dumps(state)
+            )
+            logger.info("State saved successfully")
+        except Exception as e:
+            logger.error(f"Error saving state: {e}")
+            logger.error(traceback.format_exc())
+
+    def _verify_index_integrity(self):
+        """Verify the integrity of the index."""
+        try:
+            with self.index.ix.searcher() as searcher:
+                # Try a simple search to verify index is working
+                searcher.search(self.index.ix.schema.parse_query("test"))
+                return True
+        except Exception as e:
+            logger.error(f"Index integrity check failed: {e}")
+            return False
+
+    def _reload_index_from_s3(self):
+        """Reload the index from S3."""
+        try:
+            if self.latest_index_key:
+                logger.info(f"Reloading index from S3: {self.latest_index_key}")
+                self.index.load_from_s3(self.s3, INDEX_DATA_BUCKET, self.latest_index_key)
+                logger.info("Index reloaded successfully")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Error reloading index: {e}")
+            logger.error(traceback.format_exc())
+            return False
+
+    def _cleanup_failed_tasks(self):
+        """Clean up tasks that have exceeded max retries."""
+        tasks_to_remove = []
+        for task_id, retry_count in self.failed_tasks.items():
+            if retry_count >= self.max_retries:
+                tasks_to_remove.append(task_id)
+        
+        for task_id in tasks_to_remove:
+            try:
+                # Remove from DynamoDB
+                self.dynamodb.Table('failed-tasks').delete_item(
+                    Key={'task_id': task_id}
+                )
+                # Remove from local tracking
+                del self.failed_tasks[task_id]
+                logger.info(f"Removed failed task {task_id} after max retries")
+            except Exception as e:
+                logger.error(f"Error cleaning up failed task {task_id}: {e}")
+
+    def _handle_high_memory_usage(self):
+        """Handle high memory usage."""
+        try:
+            # Force garbage collection
+            import gc
+            gc.collect()
+            
+            # Save current state and reload index
+            self._save_state()
+            self._reload_index_from_s3()
+            
+            logger.info("Memory usage handled")
+        except Exception as e:
+            logger.error(f"Error handling high memory usage: {e}")
+
+    def _handle_large_index(self):
+        """Handle large index size."""
+        try:
+            # Save current index to S3
+            index_key = self.index.save_to_s3(self.s3, INDEX_DATA_BUCKET)
+            if index_key:
+                self._save_index_metadata(index_key)
+                logger.info("Large index saved to S3")
+        except Exception as e:
+            logger.error(f"Error handling large index: {e}")
+
+    def _process_task(self, task):
+        """Process an index task with enhanced error handling and recovery."""
+        try:
+            url = task['url']
+            content = task['content']
+            task_id = task.get('task_id', str(uuid.uuid4()))
+            
+            logger.info(f"Processing task {task_id} for URL: {url}")
+            
+            # Check if task has timed out
+            if 'start_time' in task:
+                if time.time() - task['start_time'] > self.task_timeout:
+                    logger.warning(f"Task {task_id} has timed out")
+                    self._handle_task_timeout(task_id, task)
+                    return
+            
+            # Add the document to the index
+            start_time = time.time()
+            success = self.index.add_document(url, content)
+            end_time = time.time()
+            
+            if success:
+                self.last_successful_task = time.time()
+                logger.info(f"Task {task_id} completed in {end_time - start_time:.2f} seconds")
+                
+                # Store success in DynamoDB
+                self._record_task_success(task_id, url, end_time - start_time)
+            else:
+                logger.error(f"Task {task_id} failed")
+                self._handle_task_failure(task_id, task)
+            
+        except Exception as e:
+            logger.error(f"Error processing task {task_id}: {e}")
+            logger.error(traceback.format_exc())
+            self._handle_task_failure(task_id, task)
+
+    def _handle_task_timeout(self, task_id, task):
+        """Handle a task that has timed out."""
+        try:
+            # Record timeout in DynamoDB
+            self.dynamodb.Table('failed-tasks').put_item(
+                Item={
+                    'task_id': task_id,
+                    'url': task['url'],
+                    'error': 'timeout',
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'retry_count': self.failed_tasks.get(task_id, 0)
+                }
+            )
+            
+            # Add to failed tasks if not already there
+            if task_id not in self.failed_tasks:
+                self.failed_tasks[task_id] = 0
+            
+            logger.warning(f"Task {task_id} marked as timed out")
+        except Exception as e:
+            logger.error(f"Error handling task timeout: {e}")
+
+    def _handle_task_failure(self, task_id, task):
+        """Handle a failed task."""
+        try:
+            # Record failure in DynamoDB
+            self.dynamodb.Table('failed-tasks').put_item(
+                Item={
+                    'task_id': task_id,
+                    'url': task['url'],
+                    'error': 'processing_failed',
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'retry_count': self.failed_tasks.get(task_id, 0)
+                }
+            )
+            
+            # Add to failed tasks if not already there
+            if task_id not in self.failed_tasks:
+                self.failed_tasks[task_id] = 0
+            
+            logger.warning(f"Task {task_id} marked as failed")
+        except Exception as e:
+            logger.error(f"Error handling task failure: {e}")
+
+    def _record_task_success(self, task_id, url, processing_time):
+        """Record successful task completion."""
+        try:
+            self.dynamodb.Table('indexed-documents').put_item(
+                Item={
+                    'url': url,
+                    'task_id': task_id,
+                    'indexed_at': datetime.now(timezone.utc).isoformat(),
+                    'indexer_id': self.indexer_id,
+                    'processing_time': f"{processing_time:.2f}",
+                    'status': 'success'
+                }
+            )
+        except Exception as e:
+            logger.error(f"Error recording task success: {e}")
+
     def start(self):
         """Start the indexer node."""
         logger.info("Starting indexer node")
@@ -555,47 +1004,6 @@ class IndexerNode:
             logger.error(f"Error getting index task: {e}")
             logger.error(traceback.format_exc())
             return None
-    
-    def _process_task(self, task):
-        """Process an index task."""
-        try:
-            url = task['url']
-            content = task['content']
-            
-            logger.info(f"Indexing URL: {url}")
-            logger.debug(f"Content keys: {list(content.keys())}")
-            
-            # Add the document to the index
-            start_time = time.time()
-            success = self.index.add_document(url, content)
-            end_time = time.time()
-            
-            logger.info(f"Indexing completed in {end_time - start_time:.2f} seconds, success: {success}")
-            
-            # Store indexing metadata in DynamoDB
-            try:
-                logger.debug("Storing indexing metadata in DynamoDB")
-                self.dynamodb.Table('indexed-documents').put_item(
-                    Item={
-                        'url': url,
-                        'title': content.get('title', ''),
-                        'indexed_at': datetime.now(timezone.utc).isoformat(),
-                        'indexer_id': self.indexer_id,
-                        'success': success,
-                        's3_raw_path': task.get('s3_raw_path', ''),
-                        'processing_time': f"{end_time - start_time:.2f}"
-                    }
-                )
-                logger.debug("Indexing metadata stored successfully")
-            except Exception as e:
-                logger.error(f"Error storing index metadata in DynamoDB: {e}")
-                logger.error(traceback.format_exc())
-        except KeyError as e:
-            logger.error(f"Missing required field in task: {e}")
-            logger.error(f"Task structure: {task.keys()}")
-        except Exception as e:
-            logger.error(f"Error processing task: {e}")
-            logger.error(traceback.format_exc())
     
     def search(self, query, max_results=10):
         """Search the index."""

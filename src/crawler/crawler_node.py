@@ -18,6 +18,13 @@ import os
 import threading
 import logging
 import traceback
+import crochet
+import psutil
+from collections import defaultdict
+from decimal import Decimal
+from scrapy.crawler import CrawlerRunner
+from twisted.internet import reactor
+
 
 # Add the parent directory to the path so we can import common modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -36,6 +43,11 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+def decimal_default(obj):
+    if isinstance(obj, Decimal):
+        return float(obj)
+    raise TypeError
 
 class WebPage(Item):
     """Scrapy Item for storing web page data."""
@@ -141,6 +153,15 @@ class CrawlerNode:
         self.s3 = boto3.client('s3', region_name=AWS_REGION)
         self.dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
         
+        # Fault tolerance settings
+        self.task_timeout = 300  # 5 minutes
+        self.max_retries = 3
+        self.recovery_interval = 60  # seconds
+        self.last_heartbeat = time.time()
+        self.failed_tasks = defaultdict(int)  # Track failed tasks and retry counts
+        self.active_tasks = {}  # Track active tasks and their start times
+        self.task_lock = threading.Lock()  # Lock for thread-safe task operations
+        
         # Get queue URLs or create them if they don't exist
         try:
             logger.info(f"Connecting to SQS queue: {CRAWL_TASK_QUEUE}")
@@ -152,7 +173,7 @@ class CrawlerNode:
             response = self.sqs.create_queue(
                 QueueName=CRAWL_TASK_QUEUE,
                 Attributes={
-                    'VisibilityTimeout': '60',  # 1 minute
+                    'VisibilityTimeout': str(self.task_timeout),  # Match task timeout
                     'MessageRetentionPeriod': '86400'  # 1 day
                 }
             )
@@ -168,7 +189,7 @@ class CrawlerNode:
             response = self.sqs.create_queue(
                 QueueName=CRAWL_RESULT_QUEUE,
                 Attributes={
-                    'VisibilityTimeout': '60',  # 1 minute
+                    'VisibilityTimeout': str(self.task_timeout),  # Match task timeout
                     'MessageRetentionPeriod': '86400'  # 1 day
                 }
             )
@@ -218,6 +239,9 @@ class CrawlerNode:
             'LOG_LEVEL': 'ERROR',  # Only show errors, not info messages
             'LOG_ENABLED': False,  # Disable logging completely if you want no output
             'REQUEST_FINGERPRINTER_IMPLEMENTATION': '2.7',  # Add this line to fix the deprecation warning
+            'DOWNLOAD_TIMEOUT': self.task_timeout,  # Match task timeout
+            'RETRY_TIMES': self.max_retries,  # Match max retries
+            'RETRY_HTTP_CODES': [500, 502, 503, 504, 408, 429],  # Retry on these HTTP codes
         })
         logger.info("Scrapy settings initialized")
         # Flag to control the crawler
@@ -229,6 +253,11 @@ class CrawlerNode:
         # Start heartbeat thread
         self.heartbeat_thread = threading.Thread(target=self._send_heartbeats)
         self.heartbeat_thread.daemon = True
+        
+        # Start recovery thread
+        self.recovery_thread = threading.Thread(target=self._recovery_loop)
+        self.recovery_thread.daemon = True
+        
         logger.info("Crawler node initialization complete")
     
     def _ensure_dynamodb_tables(self):
@@ -342,14 +371,17 @@ class CrawlerNode:
         heartbeat = {
             'type': 'heartbeat',  # Add message type
             'crawler_id': self.crawler_id,
-            'timestamp': time.time(),
-            'status': 'active'
+            'timestamp': Decimal(str(time.time())),
+            'status': 'active',
+            'memory_usage': Decimal(str(self._get_memory_usage())),
+            'active_tasks': Decimal(str(len(self.active_tasks))),
+            'failed_tasks': Decimal(str(len(self.failed_tasks)))
         }
         
         try:
             self.sqs.send_message(
                 QueueUrl=self.crawl_result_queue_url,  # Make sure this is the RESULT queue
-                MessageBody=json.dumps(heartbeat)
+                MessageBody=json.dumps(heartbeat, default=decimal_default)
             )
         except Exception as e:
             print(f"Error sending heartbeat: {e}")
@@ -456,96 +488,92 @@ class CrawlerNode:
             
     
     def _process_task(self, task):
-        """Process a crawl task using Scrapy."""
+        """Process a crawl task using Scrapy with enhanced error handling."""
         url = task['url']
-        # Use get() with a default value instead of direct access
         task_id = task.get('task_id', f"task-{uuid.uuid4()}")
         depth = task.get('depth', 0)
         max_depth = task.get('max_depth', 3)
         
-        # Validate URL - ensure it has a scheme and correct typos
-        if not url:
-            logger.error("Empty URL provided in task")
-            self._report_crawl_result(task_id, None, [], "error", "Empty URL provided")
-            return
-        
-        # Validate and correct URL
-        url = self._validate_url(url)
-        if not url:
-            logger.error("Invalid URL provided in task")
-            self._report_crawl_result(task_id, None, [], "error", "Invalid URL provided")
-            return
-        
-        # Update the task URL
-        task['url'] = url
-        logger.info(f"Processing URL: {url} (task_id: {task_id}, depth: {depth}/{max_depth})")
-        
-        # Create a temporary directory for this crawl
-        import tempfile
-        temp_dir = tempfile.mkdtemp()
-        logger.debug(f"Created temporary directory: {temp_dir}")
+        # Add task to active tasks
+        with self.task_lock:
+            self.active_tasks[task_id] = time.time()
         
         try:
-            # Use CrawlerRunner instead of CrawlerProcess
-            from scrapy.crawler import CrawlerRunner
-            from twisted.internet import reactor
-            import crochet
+            # Validate URL
+            if not url:
+                logger.error("Empty URL provided in task")
+                self._report_crawl_result(task_id, None, [], "error", "Empty URL provided")
+                return
             
-            # Initialize crochet
-            crochet.setup()
-            logger.debug("Crochet setup complete")
+            # Validate and correct URL
+            url = self._validate_url(url)
+            if not url:
+                logger.error("Invalid URL provided in task")
+                self._report_crawl_result(task_id, None, [], "error", "Invalid URL provided")
+                return
             
-            # Create a new CrawlerRunner for each task with reduced logging
-            self.settings.update({'LOG_LEVEL': 'ERROR'})  # Only show errors, not info messages
-            runner = CrawlerRunner(self.settings)
-            logger.debug("CrawlerRunner created")
+            # Update the task URL
+            task['url'] = url
+            logger.info(f"Processing URL: {url} (task_id: {task_id}, depth: {depth}/{max_depth})")
             
-            # Define a callback to handle results after the crawl is complete
-            def handle_spider_closed(spider):
-                logger.info(f"Spider closed for URL: {url}")
-                # Process the results from the spider
-                if hasattr(spider, 'results') and spider.results:
-                    logger.info(f"Spider returned {len(spider.results)} results")
-                    for res in spider.results:
-                        # Print only the parsed content
-                        logger.info(f"Processing result for URL: {res['url']}")
-                        content = res['content']
-                        title = content.get('title', ['No title'])[0] if isinstance(content.get('title'), list) else content.get('title', 'No title')
-                        logger.info(f"Title: {title}")
-                        logger.info(f"Discovered URLs: {len(res['discovered_urls'])}")
-                        
-                        # Send the result to the master
-                        logger.info(f"Sending result to master for URL: {res['url']}")
-                        self._send_result(res, task)
-                else:
-                    logger.warning(f"Spider returned no results for URL: {url}")
+            # Create a temporary directory for this crawl
+            import tempfile
+            temp_dir = tempfile.mkdtemp()
+            logger.debug(f"Created temporary directory: {temp_dir}")
             
-            # Use crochet to run the crawl in a controlled way
-            logger.info(f"Starting spider for URL: {url}")
-            @crochet.wait_for(timeout=180)
-            def run_spider():
-                crawler = runner.create_crawler(WebSpider)
-                crawler.signals.connect(handle_spider_closed, signal=signals.spider_closed)
-                logger.debug(f"Spider signals connected for URL: {url}")
-                return runner.crawl(crawler, url=url, task_id=task_id, depth=depth)
-            
-            # Run the spider with crochet
-            run_spider()
-            logger.info(f"Spider completed for URL: {url}")
-            
-        except Exception as e:
-            logger.error(f"Error processing task for URL {url}: {e}")
-            logger.error(traceback.format_exc())
-            
-            # Update URL frontier to mark as failed
             try:
-                logger.info(f"Updating URL frontier to mark URL as failed: {url}")
-                self._update_url_frontier_after_failure(url, task, str(e))
-            except Exception as update_error:
-                logger.error(f"Error updating URL frontier after failure: {update_error}")
+                # Use CrawlerRunner instead of CrawlerProcess
+                
+                
+                # Initialize crochet
+                crochet.setup()
+                logger.debug("Crochet setup complete")
+                
+                # Create a new CrawlerRunner for each task
+                runner = CrawlerRunner(self.settings)
+                logger.debug("CrawlerRunner created")
+                
+                # Define a callback to handle results after the crawl is complete
+                def handle_spider_closed(spider):
+                    logger.info(f"Spider closed for URL: {url}")
+                    # Process the results from the spider
+                    if hasattr(spider, 'results') and spider.results:
+                        logger.info(f"Spider returned {len(spider.results)} results")
+                        for res in spider.results:
+                            # Send the result to the master
+                            logger.info(f"Sending result to master for URL: {res['url']}")
+                            self._send_result(res, task)
+                    else:
+                        logger.warning(f"Spider returned no results for URL: {url}")
+                        self._handle_task_failure(task_id, task, "No results returned")
+                
+                # Use crochet to run the crawl in a controlled way
+                logger.info(f"Starting spider for URL: {url}")
+                @crochet.wait_for(timeout=self.task_timeout)
+                def run_spider():
+                    crawler = runner.create_crawler(WebSpider)
+                    crawler.signals.connect(handle_spider_closed, signal=signals.spider_closed)
+                    logger.debug(f"Spider signals connected for URL: {url}")
+                    return runner.crawl(crawler, url=url, task_id=task_id, depth=depth)
+                
+                # Run the spider with crochet
+                run_spider()
+                logger.info(f"Spider completed for URL: {url}")
+                
+            except crochet.TimeoutError:
+                logger.error(f"Spider timed out for URL: {url}")
+                self._handle_task_timeout(task_id, task)
+            except Exception as e:
+                logger.error(f"Error processing task for URL {url}: {e}")
                 logger.error(traceback.format_exc())
+                self._handle_task_failure(task_id, task, str(e))
                 
         finally:
+            # Remove task from active tasks
+            with self.task_lock:
+                if task_id in self.active_tasks:
+                    del self.active_tasks[task_id]
+            
             # Clean up the temporary directory
             import shutil
             try:
@@ -553,6 +581,53 @@ class CrawlerNode:
                 logger.debug(f"Cleaned up temporary directory: {temp_dir}")
             except Exception as e:
                 logger.error(f"Error cleaning up temporary directory: {e}")
+
+    def _handle_task_failure(self, task_id, task, error_message):
+        """Handle a failed task."""
+        try:
+            # Record failure in DynamoDB
+            self.dynamodb.Table('url-frontier').update_item(
+                Key={
+                    'url': task['url'],
+                    'job_id': task['job_id']
+                },
+                UpdateExpression="SET #status = :status, error_message = :error, retry_count = if_not_exists(retry_count, :zero) + :one",
+                ExpressionAttributeNames={
+                    '#status': 'status'
+                },
+                ExpressionAttributeValues={
+                    ':status': 'failed',
+                    ':error': str(error_message)[:1024],  # Truncate long error messages
+                    ':zero': 0,
+                    ':one': 1
+                }
+            )
+            
+            # Add to failed tasks if not already there
+            if task_id not in self.failed_tasks:
+                self.failed_tasks[task_id] = 0
+            
+            logger.warning(f"Task {task_id} marked as failed: {error_message}")
+        except Exception as e:
+            logger.error(f"Error handling task failure: {e}")
+
+    def _requeue_task(self, task):
+        """Re-queue a task to the crawl task queue."""
+        try:
+            # Add retry information to the task
+            task['retry_count'] = self.failed_tasks.get(task['task_id'], 0) + 1
+            task['last_retry'] = datetime.now(timezone.utc).isoformat()
+            
+            # Send the task back to the queue
+            self.sqs.send_message(
+                QueueUrl=self.crawl_task_queue_url,
+                MessageBody=json.dumps(task)
+            )
+            
+            logger.info(f"Re-queued task for URL: {task['url']}")
+        except Exception as e:
+            logger.error(f"Error re-queueing task: {e}")
+            logger.error(traceback.format_exc())
 
     def _validate_url(self, url):
             """Ensure URL has a proper scheme and correct common typos."""
@@ -760,55 +835,238 @@ class CrawlerNode:
             logger.error(traceback.format_exc())
             raise
 
-if __name__ == "__main__":
-    # Create and start a crawler node
-    crawler = CrawlerNode()
-    try:
-        crawler.start()
-    except KeyboardInterrupt:
-        crawler.stop()
+    def _recovery_loop(self):
+        """Recovery thread that handles failed tasks and system recovery."""
+        logger.info("Starting recovery loop")
+        while self.running:
+            try:
+                # Check for timed out tasks
+                self._check_timed_out_tasks()
+                
+                # Check for failed tasks that need retrying
+                self._retry_failed_tasks()
+                
+                # Check system health
+                self._check_system_health()
+                
+                time.sleep(self.recovery_interval)
+            except Exception as e:
+                logger.error(f"Error in recovery loop: {e}")
+                logger.error(traceback.format_exc())
+                time.sleep(5)
+
+    def _check_timed_out_tasks(self):
+        """Check for tasks that have exceeded their timeout."""
+        current_time = time.time()
+        timed_out_tasks = []
         
-        # Don't try to update URL frontier on shutdown as 'task' might not be defined
-        print("Crawler stopped by user")
+        with self.task_lock:
+            for task_id, start_time in list(self.active_tasks.items()):
+                if current_time - start_time > self.task_timeout:
+                    timed_out_tasks.append(task_id)
+                    del self.active_tasks[task_id]
         
-        # After processing is complete, update URL frontier
+        for task_id in timed_out_tasks:
+            try:
+                # Get task details from DynamoDB
+                response = self.dynamodb.Table('url-frontier').query(
+                    IndexName='task_id-index',
+                    KeyConditionExpression='task_id = :task_id',
+                    ExpressionAttributeValues={':task_id': task_id}
+                )
+                
+                if response['Items']:
+                    task = response['Items'][0]
+                    logger.warning(f"Task {task_id} timed out for URL: {task['url']}")
+                    self._handle_task_timeout(task_id, task)
+            except Exception as e:
+                logger.error(f"Error handling timed out task {task_id}: {e}")
+                logger.error(traceback.format_exc())
+
+    def _retry_failed_tasks(self):
+        """Retry failed tasks that haven't exceeded max retries."""
+        tasks_to_retry = []
+        
+        # Get tasks that haven't exceeded max retries
+        for task_id, retry_count in self.failed_tasks.items():
+            if retry_count < self.max_retries:
+                tasks_to_retry.append(task_id)
+        
+        if tasks_to_retry:
+            logger.info(f"Retrying {len(tasks_to_retry)} failed tasks")
+            for task_id in tasks_to_retry:
+                try:
+                    # Get task from DynamoDB
+                    response = self.dynamodb.Table('url-frontier').query(
+                        IndexName='task_id-index',
+                        KeyConditionExpression='task_id = :task_id',
+                        ExpressionAttributeValues={':task_id': task_id}
+                    )
+                    
+                    if response['Items']:
+                        task = response['Items'][0]
+                        # Re-queue the task
+                        self._requeue_task(task)
+                        # Update retry count
+                        self.failed_tasks[task_id] += 1
+                        logger.info(f"Re-queued task {task_id}, retry count: {self.failed_tasks[task_id]}")
+                except Exception as e:
+                    logger.error(f"Error retrying task {task_id}: {e}")
+                    logger.error(traceback.format_exc())
+
+    def _check_system_health(self):
+        """Check system health and take corrective actions if needed."""
         try:
-            # Use crawler.dynamodb instead of self.dynamodb
-            frontier_table = crawler.dynamodb.Table('url-frontier')
+            # Check if we're receiving heartbeats
+            if time.time() - self.last_heartbeat > HEARTBEAT_INTERVAL * 2:
+                logger.warning("No recent heartbeats, attempting recovery")
+                self._attempt_recovery()
             
-            # Update the URL status to completed
-            frontier_table.update_item(
-                Key={'url':task['url'],
-                     'job_id': task['job_id']
-                },
-                UpdateExpression="SET #status = :status, last_crawled = :timestamp",
-                ExpressionAttributeNames={
-                    '#status': 'status'
-                },
-                ExpressionAttributeValues={
-                    ':status': 'completed',
-                    ':timestamp': datetime.now(timezone.utc).isoformat()
-                }
-            )
+            # Check memory usage
+            memory_usage = self._get_memory_usage()
+            if memory_usage > 1000:  # More than 1GB
+                logger.warning(f"High memory usage: {memory_usage}MB")
+                self._handle_high_memory_usage()
+            
+            # Check active tasks
+            with self.task_lock:
+                if len(self.active_tasks) > 10:  # More than 10 concurrent tasks
+                    logger.warning(f"High number of active tasks: {len(self.active_tasks)}")
+                    self._handle_high_task_load()
+                
         except Exception as e:
-            print(f"Error updating URL frontier after completion: {e}")
-            
-        # Update URL frontier to mark as failed
+            logger.error(f"Error checking system health: {e}")
+            logger.error(traceback.format_exc())
+
+    def _attempt_recovery(self):
+        """Attempt to recover from failures."""
         try:
-            # Use crawler.dynamodb instead of self.dynamodb
-            frontier_table = crawler.dynamodb.Table('url-frontier')
+            # Save current state
+            self._save_state()
             
-            # Update the URL status to failed
-            frontier_table.update_item(
-                Key={'url':task['url']},
-                UpdateExpression="SET #status = :status, last_crawled = :timestamp",
+            # Reset failed tasks if they've exceeded max retries
+            self._cleanup_failed_tasks()
+            
+            # Re-register with master
+            self._register_with_master()
+            
+            logger.info("Recovery attempt completed")
+        except Exception as e:
+            logger.error(f"Error during recovery: {e}")
+            logger.error(traceback.format_exc())
+
+    def _save_state(self):
+        """Save current state to S3 for recovery."""
+        try:
+            state = {
+                'crawler_id': self.crawler_id,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'failed_tasks': dict(self.failed_tasks),
+                'active_tasks': dict(self.active_tasks)
+            }
+            
+            # Save to S3
+            self.s3.put_object(
+                Bucket=CRAWL_DATA_BUCKET,
+                Key=f"crawler-state/{self.crawler_id}.json",
+                Body=json.dumps(state)
+            )
+            logger.info("State saved successfully")
+        except Exception as e:
+            logger.error(f"Error saving state: {e}")
+            logger.error(traceback.format_exc())
+
+    def _handle_task_timeout(self, task_id, task):
+        """Handle a task that has timed out."""
+        try:
+            # Record timeout in DynamoDB
+            self.dynamodb.Table('url-frontier').update_item(
+                Key={
+                    'url': task['url'],
+                    'job_id': task['job_id']
+                },
+                UpdateExpression="SET #status = :status, error_message = :error, timeout_count = if_not_exists(timeout_count, :zero) + :one",
                 ExpressionAttributeNames={
                     '#status': 'status'
                 },
                 ExpressionAttributeValues={
-                    ':status': 'failed',
-                    ':timestamp': datetime.now(timezone.utc).isoformat()
+                    ':status': 'timeout',
+                    ':error': 'Task timed out',
+                    ':zero': 0,
+                    ':one': 1
                 }
             )
-        except Exception as e_inner:
-            print(f"Error updating URL frontier after failure: {e_inner}")
+            
+            # Add to failed tasks if not already there
+            if task_id not in self.failed_tasks:
+                self.failed_tasks[task_id] = 0
+            
+            logger.warning(f"Task {task_id} marked as timed out")
+        except Exception as e:
+            logger.error(f"Error handling task timeout: {e}")
+
+    def _handle_high_memory_usage(self):
+        """Handle high memory usage."""
+        try:
+            # Force garbage collection
+            import gc
+            gc.collect()
+            
+            # Save current state
+            self._save_state()
+            
+            # Reduce concurrent requests
+            self.settings.update({'CONCURRENT_REQUESTS': 1})
+            
+            logger.info("Memory usage handled")
+        except Exception as e:
+            logger.error(f"Error handling high memory usage: {e}")
+
+    def _handle_high_task_load(self):
+        """Handle high number of active tasks."""
+        try:
+            # Reduce concurrent requests
+            self.settings.update({'CONCURRENT_REQUESTS': 1})
+            
+            # Increase download delay
+            self.settings.update({'DOWNLOAD_DELAY': 2.0})
+            
+            logger.info("Task load handled")
+        except Exception as e:
+            logger.error(f"Error handling high task load: {e}")
+
+    def _get_memory_usage(self):
+        """Get current memory usage of the process."""
+        try:
+            process = psutil.Process()
+            return process.memory_info().rss / 1024 / 1024  # Convert to MB
+        except:
+            return 0
+
+if __name__ == "__main__":
+    try:
+        # Initialize logging
+        logger.info("Initializing crawler node")
+        
+        # Create crawler instance
+        crawler = CrawlerNode()
+        logger.info(f"Crawler node {crawler.crawler_id} initialized successfully")
+        
+        # Start the crawler
+        logger.info("Starting crawler node main loop")
+        crawler.start()
+        
+    except KeyboardInterrupt:
+        logger.info("Received keyboard interrupt, initiating graceful shutdown...")
+        try:
+            # Stop the crawler
+            crawler.stop()
+            logger.info("Crawler node stopped successfully")
+        except Exception as e:
+            logger.error(f"Error during crawler shutdown: {e}")
+            logger.error(traceback.format_exc())
+            
+    except Exception as e:
+        logger.error(f"Fatal error in crawler node: {e}")
+        logger.error(traceback.format_exc())
+        sys.exit(1)

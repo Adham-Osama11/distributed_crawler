@@ -11,7 +11,7 @@ from datetime import datetime
 
 # Add the parent directory to the path so we can import common modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.config import AWS_REGION, INDEX_DATA_BUCKET
+from common.config import AWS_REGION, CRAWL_DATA_BUCKET, INDEX_DATA_BUCKET 
 
 app = Flask(__name__)
 

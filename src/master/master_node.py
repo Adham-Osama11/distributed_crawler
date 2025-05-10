@@ -622,7 +622,7 @@ class MasterNode:
         
         try:
             self.sqs.send_message(
-                QueueUrl=self.index_task_queue_url,
+                QueueUrl=self.index_task_url,
                 MessageBody=json.dumps(index_task)
             )
             print(f"Sent to indexer: {result['url']}")
@@ -1002,6 +1002,29 @@ class MasterNode:
         except Exception as e:
             logger.error(f"Error fetching content from S3 for key {s3_key}: {e}")
             return 0
+
+    def _send_heartbeat(self):
+        """Send a heartbeat to DynamoDB with enhanced status information."""
+        logger.debug("Sending heartbeat")
+        try:
+            timestamp = datetime.now(timezone.utc).isoformat()
+            status = {
+                'indexer_id': self.indexer_id,
+                'timestamp': timestamp,
+                'status': 'active',
+                'processed_count': Decimal(str(self.processed_count)),
+                'document_count': Decimal(str(self.document_count)),
+                'failed_tasks': Decimal(str(len(self.failed_tasks))),
+                'last_successful_task': self.last_successful_task if hasattr(self, 'last_successful_task') else None,
+                'memory_usage': Decimal(str(self._get_memory_usage())),
+                'index_size': Decimal(str(self._get_index_size()))
+            }
+            self.dynamodb.Table('indexer-status').put_item(Item=status)
+            self.last_heartbeat = time.time()
+            logger.debug(f"Heartbeat sent at {timestamp}, status: {status}")
+        except Exception as e:
+            logger.error(f"Error sending heartbeat: {e}")
+            logger.error(traceback.format_exc())
 
 # Main execution block
 if __name__ == "__main__":

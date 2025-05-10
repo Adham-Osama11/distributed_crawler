@@ -41,7 +41,7 @@ except LookupError:
 
 # Add the parent directory to the path so we can import common modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.config import INDEX_TASK_QUEUE, INDEX_DATA_BUCKET
+from common.config import INDEX_TASK_QUEUE, INDEX_DATA_BUCKET, CRAWL_DATA_BUCKET
 
 # Configure logging
 logging.basicConfig(
@@ -818,7 +818,7 @@ class IndexerNode:
             if 'content' not in task and 's3_key' in task:
                 s3_key = task['s3_key']
                 try:
-                    s3_obj = self.s3.get_object(Bucket=INDEX_DATA_BUCKET, Key=s3_key)
+                    s3_obj = self.s3.get_object(Bucket=CRAWL_DATA_BUCKET, Key=s3_key)
                     content = json.loads(s3_obj['Body'].read().decode('utf-8'))
                     task['content'] = content
                 except Exception as e:
@@ -1036,7 +1036,7 @@ class IndexerNode:
                 if 'content' not in task and 's3_key' in task:
                     s3_key = task['s3_key']
                     try:
-                        s3_obj = self.s3.get_object(Bucket=INDEX_DATA_BUCKET, Key=s3_key)
+                        s3_obj = self.s3.get_object(Bucket=CRAWL_DATA_BUCKET, Key=s3_key)
                         content = json.loads(s3_obj['Body'].read().decode('utf-8'))
                         task['content'] = content
                     except Exception as e:

@@ -407,45 +407,76 @@ class MasterNode:
             logger.error(traceback.format_exc())
  
     def process_crawl_results(self):
-        """Process incoming crawl result messages."""
+        """Process crawl results from the result queue."""
         try:
-            logger.info("Checking for crawl results...")
             # Receive messages from the crawl result queue
             response = self.sqs.receive_message(
                 QueueUrl=self.crawl_result_queue_url,
                 MaxNumberOfMessages=10,
-                WaitTimeSeconds=5
+                WaitTimeSeconds=1
             )
             
             if 'Messages' not in response:
                 return
             
-            for message in response['Messages']:
+            for message in response.get('Messages', []):
                 try:
-                    # Log the full message body for debugging
-                    logger.info(f"Received message body: {message['Body']}")
-                    # Parse the message
-                    result = json.loads(message['Body'])
+                    # Parse the message body
+                    body = json.loads(message['Body'])
+                    logger.info(f"Received message body: {json.dumps(body)}")
                     
-                    # Check if this is a heartbeat message
-                    if 'crawler_id' in result and 'status' in result and result.get('status') == 'active':
-                        self._handle_heartbeat(result)
+                    # Handle different message types
+                    if body.get('type') == 'heartbeat':
+                        # Process heartbeat message
+                        crawler_id = body.get('crawler_id')
+                        logger.info(f"Received heartbeat from crawler: {crawler_id}")
+                        self._update_crawler_status(crawler_id, body)
+                    elif body.get('type') == 'result':
+                        # Process crawl result message
+                        url = body.get('url')
+                        logger.info(f"Processing crawl result for URL: {url}")
+                        
+                        # Mark URL as completed in DynamoDB
+                        self._update_url_status(url, 'completed', body)
+                        logger.info(f"URL {url} marked as completed in DynamoDB")
+                        
+                        # Forward to indexer
+                        try:
+                            # Create a new message for the indexer
+                            index_message = {
+                                'type': 'index',
+                                'url': url,
+                                'job_id': body.get('job_id'),
+                                'task_id': body.get('task_id'),
+                                'crawler_id': body.get('crawler_id'),
+                                'timestamp': body.get('timestamp'),
+                                's3_key': body.get('s3_key')
+                            }
+                            
+                            # Send the message to the index task queue
+                            self.sqs.send_message(
+                                QueueUrl=self.index_task_queue_url,
+                                MessageBody=json.dumps(index_message)
+                            )
+                            logger.info(f"Forwarded URL {url} to indexer")
+                        except Exception as e:
+                            logger.error(f"Error forwarding to indexer: {e}")
+                            logger.error(traceback.format_exc())
+                    else:
+                        logger.warning(f"Unknown message type: {body.get('type')}")
                     
-                    # Otherwise, process as a crawl result
-                    elif 'url' in result and 'content' in result:
-                        self._process_crawl_result(result)
-                        self._send_to_indexer(result)
-                    
-                    # Delete the processed message
+                    # Delete the message from the queue
                     self.sqs.delete_message(
                         QueueUrl=self.crawl_result_queue_url,
                         ReceiptHandle=message['ReceiptHandle']
                     )
                 except Exception as e:
-                    print(f"Error processing crawl result: {e}")
+                    logger.error(f"Error processing message: {e}")
+                    logger.error(traceback.format_exc())
         except Exception as e:
-            print(f"Error receiving crawl results: {e}")
-    
+            logger.error(f"Error receiving messages: {e}")
+            logger.error(traceback.format_exc())
+            
     def _handle_heartbeat(self, heartbeat):
         """Handle a heartbeat message from a crawler node."""
         crawler_id = heartbeat.get('crawler_id')
@@ -661,7 +692,7 @@ class MasterNode:
                     self.process_client_requests()
                     self.process_crawl_results()
                     self.process_master_commands()
-                    self.process_crawl_tasks()  # Added this line to call the new method
+                    self.process_crawl_tasks()
                     time.sleep(0.1)
                 except Exception as e:
                     logger.error(f"Error in master node main loop: {e}")
@@ -669,7 +700,6 @@ class MasterNode:
                     time.sleep(1)
         except KeyboardInterrupt:
             logger.info("Received keyboard interrupt, shutting down gracefully...")
-          #  self._perform_cleanup()
             logger.info("Master node shutdown complete")
 
     def process_client_requests(self):
@@ -949,7 +979,7 @@ class MasterNode:
                         'crawl_timestamp': datetime.now(timezone.utc).isoformat(),
                         'depth': result.get('depth', 0),
                         's3_raw_path': result.get('s3_raw_path', ''),
-                        'content_length': len(result.get('content', '')),
+                        'content_length': self._get_content_length_from_s3(result.get('s3_key')),
                         'discovered_urls_count': len(result.get('discovered_urls', []))
                     }
                 )
@@ -961,6 +991,17 @@ class MasterNode:
         except Exception as e:
             logger.error(f"Error processing crawl result: {e}")
             logger.error(traceback.format_exc())
+
+    def _get_content_length_from_s3(self, s3_key):
+        if not s3_key:
+            return 0
+        try:
+            s3_obj = self.s3.get_object(Bucket=CRAWL_DATA_BUCKET, Key=s3_key)
+            content = s3_obj['Body'].read()
+            return len(content)
+        except Exception as e:
+            logger.error(f"Error fetching content from S3 for key {s3_key}: {e}")
+            return 0
 
 # Main execution block
 if __name__ == "__main__":
@@ -975,7 +1016,7 @@ if __name__ == "__main__":
                     master.process_client_requests()
                     master.process_crawl_results()
                     master.process_master_commands()
-                    master.process_crawl_tasks()  # Added this line to call the new method
+                    master.process_crawl_tasks()
                     time.sleep(0.1)
                 except Exception as e:
                     logger.error(f"Error in master node main loop: {e}")
@@ -983,7 +1024,6 @@ if __name__ == "__main__":
                     time.sleep(1)
         except KeyboardInterrupt:
             logger.info("Received keyboard interrupt, shutting down gracefully...")
-          #  self._perform_cleanup()
             logger.info("Master node shutdown complete")
     except Exception as e:
         logger.error(f"Fatal error initializing master node: {e}")

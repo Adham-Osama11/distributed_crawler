@@ -665,6 +665,10 @@ class CrawlerNode:
             url = result.get('url')
             job_id = task.get('job_id', 'unknown')
             
+            # Ensure job_id has the correct format
+            if not job_id.startswith('job-'):
+                job_id = f"job-{job_id}"
+            
             logger.info(f"Preparing result for URL: {url}, job_id: {job_id}")
             
             # Store the content in S3

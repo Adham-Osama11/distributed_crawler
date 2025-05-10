@@ -800,11 +800,30 @@ class IndexerNode:
     def _process_task(self, task):
         """Process an index task with enhanced error handling and recovery."""
         try:
-            url = task['url']
-            content = task['content']
+            # Extract task information
+            url = task.get('url', '').strip('` ')  # Remove backticks and whitespace
+            job_id = task.get('job_id')
             task_id = task.get('task_id', str(uuid.uuid4()))
+            s3_key = task.get('s3_key')
             
             logger.info(f"Processing task {task_id} for URL: {url}")
+            
+            # Validate required fields
+            if 'url' not in task or ('content' not in task and 's3_key' not in task):
+                logger.error(f"Received malformed task without required fields: {task}")
+                self._handle_task_failure(task_id, task)
+                return
+            
+            # If content is not present, but s3_key is, fetch content from S3
+            if 'content' not in task and 's3_key' in task:
+                s3_key = task['s3_key']
+                try:
+                    s3_obj = self.s3.get_object(Bucket=INDEX_DATA_BUCKET, Key=s3_key)
+                    content = json.loads(s3_obj['Body'].read().decode('utf-8'))
+                    task['content'] = content
+                except Exception as e:
+                    logger.error(f"Error fetching content from S3 for key {s3_key}: {e}")
+                    return None
             
             # Check if task has timed out
             if 'start_time' in task:
@@ -813,9 +832,19 @@ class IndexerNode:
                     self._handle_task_timeout(task_id, task)
                     return
             
+            # Check if this URL has already been indexed
+            try:
+                indexed_docs_table = self.dynamodb.Table('indexed-documents')
+                response = indexed_docs_table.get_item(Key={'url': url})
+                if 'Item' in response:
+                    logger.info(f"URL already indexed, skipping: {url}")
+                    return
+            except Exception as e:
+                logger.warning(f"Error checking if URL is already indexed: {e}")
+            
             # Add the document to the index
             start_time = time.time()
-            success = self.index.add_document(url, content)
+            success = self.index.add_document(url, task['content'])
             end_time = time.time()
             
             if success:
@@ -824,14 +853,29 @@ class IndexerNode:
                 
                 # Store success in DynamoDB
                 self._record_task_success(task_id, url, end_time - start_time)
+                
+                # Update indexed documents table with additional metadata
+                try:
+                    indexed_docs_table.put_item(
+                        Item={
+                            'url': url,
+                            'job_id': job_id,
+                            'task_id': task_id,
+                            'indexed_at': datetime.now(timezone.utc).isoformat(),
+                            's3_key': s3_key,
+                            'indexer_id': self.indexer_id
+                        }
+                    )
+                except Exception as e:
+                    logger.warning(f"Error updating indexed-documents table: {e}")
             else:
                 logger.error(f"Task {task_id} failed")
                 self._handle_task_failure(task_id, task)
             
         except Exception as e:
-            logger.error(f"Error processing task {task_id}: {e}")
+            logger.error(f"Error processing task {task.get('task_id', 'unknown')}: {e}")
             logger.error(traceback.format_exc())
-            self._handle_task_failure(task_id, task)
+            self._handle_task_failure(task.get('task_id', 'unknown'), task)
 
     def _handle_task_timeout(self, task_id, task):
         """Handle a task that has timed out."""
@@ -978,7 +1022,7 @@ class IndexerNode:
                     return None
                 
                 # Validate task structure
-                if 'url' not in task or 'content' not in task:
+                if 'url' not in task or ('content' not in task and 's3_key' not in task):
                     logger.error(f"Received malformed task without required fields: {task}")
                     # Delete the invalid message from the queue
                     logger.warning("Deleting malformed task from queue")
@@ -987,6 +1031,17 @@ class IndexerNode:
                         ReceiptHandle=message['ReceiptHandle']
                     )
                     return None
+                
+                # If content is not present, but s3_key is, fetch content from S3
+                if 'content' not in task and 's3_key' in task:
+                    s3_key = task['s3_key']
+                    try:
+                        s3_obj = self.s3.get_object(Bucket=INDEX_DATA_BUCKET, Key=s3_key)
+                        content = json.loads(s3_obj['Body'].read().decode('utf-8'))
+                        task['content'] = content
+                    except Exception as e:
+                        logger.error(f"Error fetching content from S3 for key {s3_key}: {e}")
+                        return None
                 
                 # Delete the message from the queue
                 logger.debug(f"Deleting message from queue: {message['MessageId']}")

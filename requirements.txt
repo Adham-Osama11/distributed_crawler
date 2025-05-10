@@ -1,2 +1,14 @@
 boto3==1.28.0
 scrapy==2.8.0
+beautifulsoup4==4.12.2
+nltk==3.8.1
+whoosh==2.7.4
+dash==2.14.2
+plotly==5.18.0
+psutil==5.9.8
+numpy==1.26.4
+moto==4.2.13
+pytest==7.4.3
+pytest-cov==4.1.0
+pytest-mock==3.12.0
+pytest-asyncio==0.23.2

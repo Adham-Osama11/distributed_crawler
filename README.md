@@ -34,7 +34,7 @@ The system consists of several key components:
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/distributed-web-crawler.git
+git clone https://github.com/Adham-Osama11/distributed_crawler.gitss
 cd distributed-web-crawler
 ```
 
@@ -57,9 +57,9 @@ aws configure
 
 2. Update configuration in `common/config.py`:
 ```python
-AWS_REGION = 'your-region'
-CRAWL_DATA_BUCKET = 'your-crawl-bucket'
-INDEX_DATA_BUCKET = 'your-index-bucket'
+AWS_REGION = 'us-east-1'
+CRAWL_DATA_BUCKET = 'my-crawl-data-bucket'
+INDEX_DATA_BUCKET = 'my-index-data-bucket'
 ```
 
 ## 🏃‍♂️ Running the System

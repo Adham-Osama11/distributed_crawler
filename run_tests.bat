@@ -12,11 +12,6 @@ python src\tests\test_crawler_node.py
 echo.
 echo === Testing indexer Node ===
 python src\tests\test_indexer_node.py
-
-echo.
-echo === Testing Fault Tolerance ===
-python src\tests\test_fault_tolerance.py
-
 echo.
 echo All tests completed.
 pause

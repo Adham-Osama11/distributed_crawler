@@ -682,6 +682,7 @@
                         const urls = urlText.split('/n').filter(url => url.trim() !== '');
                         const maxDepth = parseInt(document.getElementById('max-depth').value);
                         const maxUrls = parseInt(document.getElementById('max-urls').value);
+                        
                         const resultDiv = document.getElementById('submission-result');
                         resultDiv.innerHTML = '<div class="loading">Submitting URLs...</div>';
                         
@@ -744,7 +745,7 @@
                     document.getElementById('crawler-nodes-table').innerHTML = 
                         '<tr><td colspan="5" class="empty-state">Error loading crawler nodes</td></tr>';
                 });
-            }
+        }
         </script>
     </body>
 </html>

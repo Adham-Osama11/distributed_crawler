@@ -679,7 +679,8 @@
                         const urlText = document.getElementById('url-list').value;
                         if (urlText.trim() === '') return;
                         
-                        const urls = urlText.split('/n').filter(url => url.trim() !== '');
+                        const urls = urlText.split('
+').filter(url => url.trim() !== '');
                         const maxDepth = parseInt(document.getElementById('max-depth').value);
                         const maxUrls = parseInt(document.getElementById('max-urls').value);
                         
@@ -712,40 +713,6 @@
                     });
                 }
             }
-        function fetchCrawlerNodes() {
-            fetch('/api/crawler-nodes')
-                .then(response => response.json())
-                .then(data => {
-                    const tableBody = document.getElementById('crawler-nodes-table');
-                    
-                    if (data.crawler_nodes && data.crawler_nodes.length > 0) {
-                        let html = '';
-                        
-                        data.crawler_nodes.forEach(node => {
-                            const statusClass = node.status === 'active' ? 'status-active' : '';
-                            
-                            html += `
-                                <tr>
-                                    <td>${node.node_id || 'Unknown'}</td>
-                                    <td><span class="status-badge ${statusClass}">${node.status || 'unknown'}</span></td>
-                                    <td>${node.urls_crawled || 0}</td>
-                                    <td>${node.current_url || 'None'}</td>
-                                    <td>${node.last_heartbeat || 'Unknown'}</td>
-                                </tr>
-                            `;
-                        });
-                        
-                        tableBody.innerHTML = html;
-                    } else {
-                        tableBody.innerHTML = '<tr><td colspan="5" class="empty-state">No crawler nodes found</td></tr>';
-                    }
-                })
-                .catch(error => {
-                    console.error('Error fetching crawler nodes:', error);
-                    document.getElementById('crawler-nodes-table').innerHTML = 
-                        '<tr><td colspan="5" class="empty-state">Error loading crawler nodes</td></tr>';
-                });
-        }
         </script>
     </body>
 </html>

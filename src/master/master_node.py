@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import logging
 import traceback
 from decimal import Decimal
+import botocore
 
 # Add the parent directory to the path so we can import common modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -200,10 +201,41 @@ class MasterNode:
             # Get existing tables
             existing_tables = self.dynamodb.meta.client.list_tables()['TableNames']
             
-            # Create tables that don't exist
+            # Create or update tables
             for table_name, schema in tables_to_create.items():
-                if table_name not in existing_tables:
-                    print(f"Creating DynamoDB table: {table_name}")
+                if table_name in existing_tables:
+                    # Check if table needs to be recreated
+                    try:
+                        current_schema = self.dynamodb.meta.client.describe_table(TableName=table_name)
+                        current_keys = {k['AttributeName']: k['KeyType'] for k in current_schema['Table']['KeySchema']}
+                        expected_keys = {k['AttributeName']: k['KeyType'] for k in schema['KeySchema']}
+                        
+                        if current_keys != expected_keys:
+                            logger.info(f"Table {table_name} schema mismatch. Current: {current_keys}, Expected: {expected_keys}")
+                            logger.info(f"Deleting and recreating table {table_name}")
+                            # Delete the table
+                            self.dynamodb.Table(table_name).delete()
+                            # Wait for deletion
+                            self.dynamodb.meta.client.get_waiter('table_not_exists').wait(TableName=table_name)
+                            # Create new table
+                            self.dynamodb.create_table(
+                                TableName=table_name,
+                                KeySchema=schema['KeySchema'],
+                                AttributeDefinitions=schema['AttributeDefinitions'],
+                                ProvisionedThroughput={
+                                    'ReadCapacityUnits': 5,
+                                    'WriteCapacityUnits': 5
+                                }
+                            )
+                            # Wait for table to be created
+                            self.dynamodb.meta.client.get_waiter('table_exists').wait(TableName=table_name)
+                            logger.info(f"Table {table_name} recreated with new schema")
+                    except Exception as e:
+                        logger.error(f"Error checking/updating table {table_name}: {e}")
+                        raise
+                else:
+                    # Create new table
+                    logger.info(f"Creating new table {table_name}")
                     self.dynamodb.create_table(
                         TableName=table_name,
                         KeySchema=schema['KeySchema'],
@@ -214,13 +246,13 @@ class MasterNode:
                         }
                     )
                     # Wait for table to be created
-                    table = self.dynamodb.Table(table_name)
-                    table.meta.client.get_waiter('table_exists').wait(TableName=table_name)
-                    print(f"Table {table_name} created successfully")
+                    self.dynamodb.meta.client.get_waiter('table_exists').wait(TableName=table_name)
+                    logger.info(f"Table {table_name} created successfully")
             
-            print("DynamoDB tables verified")
+            logger.info("DynamoDB tables verified and updated")
         except Exception as e:
-            print(f"Error ensuring DynamoDB tables: {e}")
+            logger.error(f"Error ensuring DynamoDB tables: {e}")
+            raise
     
     def start_crawl(self, seed_urls, max_depth=3, max_urls_per_domain=100):
         """Start a new crawl with the given seed URLs."""
@@ -293,6 +325,10 @@ class MasterNode:
         """
         logger.info(f"_enqueue_url: called with url={url}, depth={depth}, max_depth={max_depth}, max_urls_per_domain={max_urls_per_domain}, crawl_id={crawl_id}")
 
+        if not url or not crawl_id:
+            logger.error(f"_enqueue_url: Missing required parameters - url={url}, crawl_id={crawl_id}")
+            return
+
         if depth > max_depth:
             logger.warning(f"_enqueue_url: Skipping {url} - depth {depth} > max_depth {max_depth}")
             return
@@ -309,15 +345,12 @@ class MasterNode:
         # Check if URL is already in the frontier
         try:
             frontier_table = self.dynamodb.Table('url-frontier')
-            job_id = f"job-{crawl_id}"
+            job_id = f"job-{crawl_id}"  # Ensure consistent job_id format
             
             logger.debug(f"Getting item from url-frontier with url={url}, job_id={job_id}")
             
-            if not url or not job_id:
-                logger.error(f"Cannot get item from url-frontier: url={url}, job_id={job_id}")
-                return
-            
             try:
+                # Use the correct key structure for the composite key
                 response = frontier_table.get_item(
                     Key={
                         'url': url,
@@ -328,6 +361,23 @@ class MasterNode:
                 # Table doesn't exist, create it
                 self._ensure_dynamodb_tables()
                 response = {}
+            except botocore.exceptions.ClientError as e:
+                error_code = e.response['Error']['Code']
+                if error_code == 'ValidationException':
+                    logger.error(f"Validation error getting item from url-frontier: {e}")
+                    logger.error(f"Key elements used - url: {url}, job_id: {job_id}")
+                    logger.error(f"Error details: {e.response['Error']}")
+                    # Ensure table has correct schema
+                    self._ensure_dynamodb_tables()
+                    # Retry the operation
+                    response = frontier_table.get_item(
+                        Key={
+                            'url': url,
+                            'job_id': job_id
+                        }
+                    )
+                else:
+                    raise
             
             if 'Item' in response:
                 status = response['Item'].get('status')
@@ -550,8 +600,8 @@ class MasterNode:
                 ':timestamp': datetime.now(timezone.utc).isoformat()
             }
             
-            # Get crawl_id from result or use a default value
-            job_id = result.get('crawl_id', 'unknown') if result else 'unknown'
+            # Get job_id from result or use a default value
+            job_id = result.get('job_id', 'unknown') if result else 'unknown'
             
             # Add additional data if available
             if result:
@@ -564,13 +614,14 @@ class MasterNode:
                     expr_attr_values[':task_id'] = result['task_id']
             
             self.dynamodb.Table('url-frontier').update_item(
-                 Key={'url': url, 'job_id': job_id},  # Use job_id instead of crawl_id
+                Key={'url': url, 'job_id': job_id},
                 UpdateExpression=update_expr,
                 ExpressionAttributeNames=expr_attr_names,
                 ExpressionAttributeValues=expr_attr_values
             )
         except Exception as e:
-            print(f"Error updating URL status: {e}")
+            logger.error(f"Error updating URL status: {e}")
+            logger.error(traceback.format_exc())
 
     def _add_to_url_frontier(self, url, depth, crawl_id):
         """Add a URL to the frontier in DynamoDB."""
@@ -633,7 +684,7 @@ class MasterNode:
         
         try:
             self.sqs.send_message(
-                QueueUrl=self.index_task_url,
+                QueueUrl=self.index_task_queue_url,
                 MessageBody=json.dumps(index_task)
             )
             print(f"Sent to indexer: {result['url']}")

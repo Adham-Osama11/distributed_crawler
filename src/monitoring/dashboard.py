@@ -69,28 +69,28 @@ class CrawlerDashboard:
                 # Get the current time
                 now = datetime.now(timezone.utc)
                 
-                # Define the cutoff time for active crawlers (e.g., last 2 minutes)
-                cutoff_time = now - timedelta(minutes=2)
+                # Define the cutoff time for active crawlers (e.g., last 5 minutes instead of 2)
+                cutoff_time = now - timedelta(minutes=5)
                 cutoff_time_str = cutoff_time.isoformat()
                 
                 # Query the crawler-status table
                 table = self.dynamodb.Table('crawler-status')
                 response = table.scan()
                 
-                # Filter for active crawlers
-                active_crawlers = []
+                # Include all crawlers, not just active ones
+                all_crawlers = []
                 for item in response.get('Items', []):
-                    last_heartbeat = item.get('last_heartbeat')
-                    if last_heartbeat and last_heartbeat > cutoff_time_str:
-                        active_crawlers.append({
-                            'crawler_id': item.get('crawler_id'),
-                            'last_heartbeat': last_heartbeat,
-                            'urls_crawled': item.get('urls_crawled', 0),
-                            'current_url': item.get('current_url', 'None')
-                        })
+                    crawler_data = {
+                        'node_id': item.get('crawler_id'),
+                        'status': item.get('status', 'unknown'),
+                        'urls_crawled': item.get('urls_crawled', 0),
+                        'current_url': item.get('current_url', 'None'),
+                        'last_heartbeat': item.get('last_heartbeat', 'unknown')
+                    }
+                    all_crawlers.append(crawler_data)
                 
                 return jsonify({
-                    'crawler_nodes': active_crawlers
+                    'crawler_nodes': all_crawlers
                 })
             except Exception as e:
                 print(f"Error getting crawler nodes: {e}")
@@ -423,25 +423,58 @@ class CrawlerDashboard:
             now = datetime.now(timezone.utc)
             twenty_four_hours_ago = now - timedelta(hours=24)
             
-            # Query the crawl-metadata table for items in the last 24 hours
-            table = self.dynamodb.Table('crawl-metadata')
-            
-            # Since we can't filter directly on crawl_time in a scan, we'll scan all and filter in memory
-            response = table.scan()
-            
-            # Process the results
+            # Try multiple tables that might contain crawl data
             timestamps = []
             
-            for item in response.get('Items', []):
-                crawl_time_str = item.get('crawl_time')
-                if crawl_time_str:
-                    try:
-                        crawl_time = datetime.fromisoformat(crawl_time_str)
-                        if crawl_time >= twenty_four_hours_ago:
-                            timestamps.append(crawl_time)
-                    except ValueError:
-                        # Skip items with invalid timestamps
-                        continue
+            # First try crawl-metadata table
+            try:
+                table = self.dynamodb.Table('crawl-metadata')
+                response = table.scan()
+                
+                for item in response.get('Items', []):
+                    crawl_time_str = item.get('crawl_time') or item.get('created_at') or item.get('timestamp')
+                    if crawl_time_str:
+                        try:
+                            # Handle different timestamp formats
+                            if isinstance(crawl_time_str, (int, float)):
+                                crawl_time = datetime.fromtimestamp(crawl_time_str, tz=timezone.utc)
+                            else:
+                                crawl_time = datetime.fromisoformat(crawl_time_str.replace('Z', '+00:00'))
+                            
+                            if crawl_time >= twenty_four_hours_ago:
+                                timestamps.append(crawl_time)
+                        except (ValueError, TypeError):
+                            # Skip items with invalid timestamps
+                            continue
+            except Exception as e:
+                print(f"Error getting data from crawl-metadata: {e}")
+            
+            # Also try url-frontier table for completed URLs
+            try:
+                table = self.dynamodb.Table('url-frontier')
+                response = table.scan(
+                    FilterExpression="#status = :status",
+                    ExpressionAttributeNames={"#status": "status"},
+                    ExpressionAttributeValues={":status": "completed"}
+                )
+                
+                for item in response.get('Items', []):
+                    crawl_time_str = item.get('completed_at') or item.get('created_at') or item.get('timestamp')
+                    if crawl_time_str:
+                        try:
+                            # Handle different timestamp formats
+                            if isinstance(crawl_time_str, (int, float)):
+                                crawl_time = datetime.fromtimestamp(crawl_time_str, tz=timezone.utc)
+                            else:
+                                crawl_time = datetime.fromisoformat(crawl_time_str.replace('Z', '+00:00'))
+                            
+                            if crawl_time >= twenty_four_hours_ago:
+                                timestamps.append(crawl_time)
+                        except (ValueError, TypeError):
+                            # Skip items with invalid timestamps
+                            continue
+            except Exception as e:
+                print(f"Error getting data from url-frontier: {e}")
             
             # Sort timestamps
             timestamps.sort()
@@ -468,17 +501,20 @@ class CrawlerDashboard:
                 current_hour += timedelta(hours=1)
             
             # If no data, provide sample data
-            if not all_hours:
+            if sum(all_counts) == 0:
+                logger.warning("No crawl history data found in any table. Using sample data.")
                 # Generate sample data for the last 24 hours
                 all_hours = [(now - timedelta(hours=x)).isoformat() for x in range(24, 0, -1)]
                 all_counts = [int(10 * (1 + 0.5 * (x % 5))) for x in range(24)]
+            else:
+                logger.info(f"Found {sum(all_counts)} crawled URLs in the last 24 hours")
             
             return {
                 'timestamps': all_hours,
                 'counts': all_counts
             }
         except Exception as e:
-            print(f"Error getting crawl history: {e}")
+            logger.error(f"Error getting crawl history: {e}")
             # Return sample data if there's an error
             now = datetime.now(timezone.utc)
             return {

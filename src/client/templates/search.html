@@ -1,363 +1,528 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Distributed Web Crawler - Search</title>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Distributed Web Crawler - Search</title>
     <style>
+        :root {
+            --primary: #4285f4;
+            --primary-dark: #3367d6;
+            --bg: #f5f5f5;
+            --card-bg: #fff;
+            --text: #333;
+            --shadow: 0 2px 5px rgba(0,0,0,0.08);
+        }
+        body.dark {
+            --primary: #90caf9;
+            --primary-dark: #1976d2;
+            --bg: #181a1b;
+            --card-bg: #23272a;
+            --text: #f5f5f5;
+            --shadow: 0 2px 8px rgba(0,0,0,0.4);
+        }
         body {
-            font-family: Arial, sans-serif;
+            font-family: 'Segoe UI', Arial, sans-serif;
             margin: 0;
-            padding: 0;
-            background-color: #f5f5f5;
+            padding: 20px;
+            background: var(--bg);
+            color: var(--text);
+            transition: background 0.3s, color 0.3s;
         }
         .container {
-            max-width: 800px;
+            max-width: 1200px;
             margin: 0 auto;
+            background: var(--card-bg);
             padding: 20px;
+            border-radius: 10px;
+            box-shadow: var(--shadow);
+            transition: background 0.3s;
+        }
+        h1 {
+            color: var(--primary);
+            letter-spacing: 1px;
+            margin-bottom: 10px;
+        }
+        .toggle-dark {
+            position: absolute;
+            top: 30px;
+            right: 40px;
+            background: var(--primary);
+            color: #fff;
+            border: none;
+            border-radius: 20px;
+            padding: 7px 18px;
+            cursor: pointer;
+            font-size: 1em;
+            transition: background 0.2s;
+        }
+        .toggle-dark:hover {
+            background: var(--primary-dark);
+        }
+        .stats {
+            background: linear-gradient(90deg, var(--primary) 0%, var(--primary-dark) 100%);
+            color: #fff;
+            padding: 25px 15px 20px 15px;
+            border-radius: 12px;
+            margin-bottom: 30px;
+            box-shadow: var(--shadow);
+            position: relative;
+            overflow: hidden;
+        }
+        .stats-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 24px;
+            justify-content: space-between;
+        }
+        .stat-card {
+            flex: 1 1 180px;
+            background: rgba(255,255,255,0.08);
+            border-radius: 10px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.07);
+            padding: 22px 10px;
+            text-align: center;
+            margin: 0 5px;
+            transition: transform 0.2s, box-shadow 0.2s;
+            position: relative;
+        }
+        .stat-card:hover {
+            transform: translateY(-4px) scale(1.03);
+            box-shadow: 0 4px 16px rgba(0,0,0,0.13);
+            background: rgba(255,255,255,0.16);
+        }
+        .stat-icon {
+            font-size: 2.2em;
+            margin-bottom: 10px;
+            filter: drop-shadow(0 1px 2px rgba(0,0,0,0.08));
+        }
+        .stat-value {
+            font-size: 2.2em;
+            font-weight: bold;
+            color: #fff;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.13);
+        }
+        .stat-label {
+            font-size: 1em;
+            color: #e3e3e3;
+            margin-top: 6px;
+            letter-spacing: 0.5px;
+        }
+        .refresh-btn {
+            position: absolute;
+            top: 18px;
+            right: 18px;
+            background: #fff;
+            color: var(--primary);
+            border: none;
+            border-radius: 4px;
+            padding: 6px 14px;
+            cursor: pointer;
+            font-size: 1em;
+            font-weight: bold;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.07);
+            transition: background 0.2s, color 0.2s;
+        }
+        .refresh-btn:hover {
+            background: var(--primary);
+            color: #fff;
+        }
+        .tabs {
+            display: flex;
+            margin-bottom: 20px;
+            border-bottom: 1px solid #ddd;
+        }
+        .tab {
+            padding: 10px 20px;
+            cursor: pointer;
+            background: var(--bg);
+            margin-right: 5px;
+            border-radius: 4px 4px 0 0;
+            transition: background 0.2s;
+        }
+        .tab.active {
+            background: var(--card-bg);
+            border: 1px solid #ddd;
+            border-bottom: 1px solid var(--card-bg);
+            margin-bottom: -1px;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+            animation: fadeIn 0.4s;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px);}
+            to { opacity: 1; transform: translateY(0);}
         }
         .search-box {
-            text-align: center;
-            margin: 40px 0;
+            margin: 20px 0;
+            display: flex;
         }
-        .search-input {
-            width: 70%;
+        .search-box input {
+            flex-grow: 1;
             padding: 10px;
             font-size: 16px;
             border: 1px solid #ddd;
-            border-radius: 4px;
+            border-radius: 4px 0 0 4px;
+            background: var(--bg);
+            color: var(--text);
+            transition: background 0.3s, color 0.3s;
         }
-        .search-button {
+        .search-box button {
             padding: 10px 20px;
-            font-size: 16px;
-            background-color: #4285f4;
+            background: var(--primary);
+            color: white;
+            border: none;
+            border-radius: 0 4px 4px 0;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .search-box button:hover {
+            background: var(--primary-dark);
+        }
+        .search-results {
+            margin-top: 20px;
+        }
+        .result-item {
+            margin-bottom: 20px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid #eee;
+            background: var(--card-bg);
+            border-radius: 6px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+            padding: 18px;
+            transition: background 0.3s;
+        }
+        .result-item h3 {
+            margin: 0;
+            color: var(--primary);
+        }
+        .result-item a {
+            color: var(--primary);
+            text-decoration: none;
+        }
+        .result-item a:hover {
+            text-decoration: underline;
+        }
+        .result-item .url {
+            color: #006621;
+            font-size: 14px;
+            margin: 5px 0;
+            word-break: break-all;
+        }
+        .result-item .description {
+            color: #545454;
+            font-size: 14px;
+        }
+        .highlight {
+            background: #ffffcc;
+            font-weight: bold;
+            border-radius: 2px;
+            padding: 0 2px;
+        }
+        .loading-spinner {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 30px 0;
+        }
+        .loading-spinner div {
+            width: 24px;
+            height: 24px;
+            border: 4px solid var(--primary);
+            border-top: 4px solid #fff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg);}
+            100% { transform: rotate(360deg);}
+        }
+        .url-input {
+            width: 100%;
+            height: 150px;
+            padding: 10px;
+            margin-bottom: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-family: Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            transition: background 0.3s, color 0.3s;
+        }
+        .submit-button {
+            padding: 10px 20px;
+            background: var(--primary);
             color: white;
             border: none;
             border-radius: 4px;
             cursor: pointer;
+            transition: background 0.2s;
         }
-        .search-button:hover {
-            background-color: #3b78e7;
+        .submit-button:hover {
+            background: var(--primary-dark);
         }
-        .results {
+        .url-results {
             margin-top: 20px;
-        }
-        .result-card {
-            background-color: white;
-            border-radius: 4px;
-            padding: 15px;
-            margin-bottom: 15px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-        .result-title {
-            color: #1a0dab;
-            font-size: 18px;
-            margin: 0 0 5px 0;
-        }
-        .result-url {
-            color: #006621;
-            font-size: 14px;
-            margin: 0 0 10px 0;
-        }
-        .result-description {
-            color: #545454;
-            font-size: 14px;
-            margin: 0;
-        }
-        .stats {
-            display: flex;
-            justify-content: space-between;
-            background-color: white;
-            padding: 15px;
-            border-radius: 4px;
-            margin-bottom: 20px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-        .stat-item {
-            text-align: center;
-        }
-        .stat-value {
-            font-size: 24px;
-            font-weight: bold;
-            color: #4285f4;
-        }
-        .stat-label {
-            font-size: 14px;
-            color: #545454;
-        }
-        .loading {
-            text-align: center;
-            margin: 20px 0;
             display: none;
         }
-        .no-results {
-            text-align: center;
-            margin: 20px 0;
-            color: #545454;
+        .url-list {
+            margin-top: 10px;
+            padding-left: 20px;
         }
-        /* Suggestions styling */
-        .suggestions {
-            position: absolute;
-            width: 70%;
-            max-height: 200px;
-            overflow-y: auto;
-            background-color: white;
-            border: 1px solid #ddd;
-            border-top: none;
-            border-radius: 0 0 4px 4px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            z-index: 10;
+        .error {
+            color: #d32f2f;
         }
-        
-        .suggestion-item {
-            padding: 10px 15px;
-            cursor: pointer;
-            transition: background-color 0.2s;
+        .success {
+            color: #388e3c;
         }
-        
-        .suggestion-item:hover {
-            background-color: #f5f5f5;
+        @media (max-width: 900px) {
+            .stats-grid { flex-direction: column; gap: 10px;}
+            .stat-card { margin: 0 0 10px 0;}
+            .container { padding: 10px;}
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1 style="text-align: center;">Distributed Web Crawler</h1>
+        <h1>Distributed Web Crawler</h1>
+        
+        <button class="toggle-dark" onclick="toggleDarkMode()">🌙 Dark Mode</button>
         
         <div class="stats">
-            <div class="stat-item">
-                <div class="stat-value">{{ stats.urls_in_frontier }}</div>
-                <div class="stat-label">URLs in Frontier</div>
-            </div>
-            <div class="stat-item">
-                <div class="stat-value">{{ stats.urls_indexed }}</div>
-                <div class="stat-label">URLs Indexed</div>
-            </div>
-            <div class="stat-item">
-                <div class="stat-value">{{ stats.active_crawlers }}</div>
-                <div class="stat-label">Active Crawlers</div>
-            </div>
-        </div>
-        
-        <div class="search-box">
-            <input type="text" id="search-input" class="search-input" placeholder="Enter search query...">
-            <button id="search-button" class="search-button">Search</button>
-        </div>
-        
-        <div id="loading" class="loading">
-            <p>Searching...</p>
-        </div>
-        
-        <div id="results" class="results"></div>
-        
-        <!-- Add URL submission form -->
-        <div class="url-submission" style="margin-top: 40px; background-color: white; padding: 20px; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
-            <h2 style="text-align: center;">Submit URL for Crawling</h2>
-            <div style="display: flex; margin-bottom: 10px;">
-                <input type="text" id="url-input" class="search-input" placeholder="Enter URL to crawl..." style="flex-grow: 1; margin-right: 10px;">
-                <button id="submit-url-button" class="search-button">Submit</button>
-            </div>
-            <div style="display: flex; justify-content: space-between;">
-                <div>
-                    <label for="max-depth">Max Depth:</label>
-                    <input type="number" id="max-depth" min="1" max="5" value="3" style="width: 50px;">
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon">🌐</div>
+                    <div class="stat-value">{{ stats.urls_in_frontier }}</div>
+                    <div class="stat-label">URLs in Frontier</div>
                 </div>
-                <div>
-                    <label for="max-urls">Max URLs per Domain:</label>
-                    <input type="number" id="max-urls" min="10" max="500" value="100" style="width: 70px;">
+                <div class="stat-card">
+                    <div class="stat-icon">📄</div>
+                    <div class="stat-value">{{ stats.urls_indexed }}</div>
+                    <div class="stat-label">URLs Indexed</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">🤖</div>
+                    <div class="stat-value">{{ stats.active_crawlers }}</div>
+                    <div class="stat-label">Active Crawlers</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">⏰</div>
+                    <div class="stat-value" style="font-size:14px;">{{ stats.last_updated }}</div>
+                    <div class="stat-label">Last Updated</div>
                 </div>
             </div>
-            <div id="url-submission-result" style="margin-top: 10px;"></div>
+            <button class="refresh-btn" onclick="refreshStats()">🔄 Refresh</button>
+        </div>
+        
+        <div class="tabs">
+            <div class="tab active" onclick="showTab('search')">Search</div>
+            <div class="tab" onclick="showTab('submit')">Submit URLs</div>
+        </div>
+        
+        <div id="search-tab" class="tab-content active">
+            <div class="search-box">
+                <input type="text" id="search-input" placeholder="Enter your search query...">
+                <button onclick="performSearch()">Search</button>
+            </div>
+            <div id="search-loading" class="loading-spinner" style="display: none;">
+                <div></div>
+            </div>
+            <div id="search-results" class="search-results"></div>
+        </div>
+        
+        <div id="submit-tab" class="tab-content">
+            <h2>Submit URLs to Crawl</h2>
+            <p>Enter one URL per line, or separate multiple URLs with commas or spaces:</p>
+            <div style="display: flex; gap: 20px; margin-bottom: 10px; flex-wrap: wrap;">
+                <div>
+                    <label for="max-depth"><b>Max Depth:</b></label>
+                    <input type="number" id="max-depth" min="1" max="10" value="3" style="width: 60px; margin-left: 5px;">
+                </div>
+                <div>
+                    <label for="max-urls"><b>Max URLs per Domain:</b></label>
+                    <input type="number" id="max-urls" min="1" max="1000" value="100" style="width: 80px; margin-left: 5px;">
+                </div>
+            </div>
+            <textarea id="url-input" class="url-input" placeholder="https://example.com&#10;https://another-example.com"></textarea>
+            <button class="submit-button" onclick="submitUrls()">Submit URLs</button>
+            
+            <div id="url-results" class="url-results">
+                <h3 id="url-results-heading"></h3>
+                
+                <div id="submitted-urls-container">
+                    <h4>Successfully Submitted:</h4>
+                    <ul id="submitted-urls" class="url-list success"></ul>
+                </div>
+                
+                <div id="invalid-urls-container">
+                    <h4>Invalid URLs:</h4>
+                    <ul id="invalid-urls" class="url-list error"></ul>
+                </div>
+                
+                <div id="failed-urls-container">
+                    <h4>Failed to Submit:</h4>
+                    <ul id="failed-urls" class="url-list error"></ul>
+                </div>
+            </div>
         </div>
     </div>
     
     <script>
-        document.addEventListener('DOMContentLoaded', function() {
-            const searchInput = document.getElementById('search-input');
-            const searchButton = document.getElementById('search-button');
-            const resultsDiv = document.getElementById('results');
-            const loadingDiv = document.getElementById('loading');
-            
-            // Set up suggestions
-            const suggestionsContainer = document.createElement('div');
-            suggestionsContainer.className = 'suggestions';
-            suggestionsContainer.style.display = 'none';
-            searchInput.parentNode.insertBefore(suggestionsContainer, searchInput.nextSibling);
-            
-            let debounceTimer;
-            
-            searchInput.addEventListener('input', function() {
-                const query = this.value.trim();
-                
-                // Clear previous timer
-                clearTimeout(debounceTimer);
-                
-                // Hide suggestions if query is too short
-                if (query.length < 2) {
-                    suggestionsContainer.style.display = 'none';
-                    return;
-                }
-                
-                // Debounce the API call
-                debounceTimer = setTimeout(() => {
-                    fetch(`/suggest?q=${encodeURIComponent(query)}`)
-                        .then(response => response.json())
-                        .then(suggestions => {
-                            // Clear previous suggestions
-                            suggestionsContainer.innerHTML = '';
-                            
-                            if (suggestions.length > 0) {
-                                // Create suggestion elements
-                                suggestions.forEach(suggestion => {
-                                    const div = document.createElement('div');
-                                    div.className = 'suggestion-item';
-                                    div.textContent = suggestion;
-                                    div.addEventListener('click', () => {
-                                        searchInput.value = suggestion;
-                                        suggestionsContainer.style.display = 'none';
-                                        document.getElementById('search-button').click();
-                                    });
-                                    suggestionsContainer.appendChild(div);
-                                });
-                                
-                                suggestionsContainer.style.display = 'block';
-                            } else {
-                                suggestionsContainer.style.display = 'none';
-                            }
-                        })
-                        .catch(error => {
-                            console.error('Error fetching suggestions:', error);
-                            suggestionsContainer.style.display = 'none';
-                        });
-                }, 300); // 300ms debounce
+        function showTab(tabName) {
+            // Hide all tab contents
+            document.querySelectorAll('.tab-content').forEach(content => {
+                content.classList.remove('active');
             });
             
-            // Hide suggestions when clicking outside
-            document.addEventListener('click', function(event) {
-                if (!searchInput.contains(event.target) && !suggestionsContainer.contains(event.target)) {
-                    suggestionsContainer.style.display = 'none';
-                }
+            // Remove active class from all tabs
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.classList.remove('active');
             });
             
-            // Function to perform search
-            function performSearch() {
-                const query = searchInput.value.trim();
-                if (!query) {
-                    return;
-                }
-                
-                // Show loading indicator
-                loadingDiv.style.display = 'block';
-                resultsDiv.innerHTML = '';
-                
-                // Perform search
-                fetch(`/search?q=${encodeURIComponent(query)}`)
-                    .then(response => response.json())
-                    .then(data => {
-                        // Hide loading indicator
-                        loadingDiv.style.display = 'none';
-                        
-                        // Display results
-                        if (data.results.length === 0) {
-                            resultsDiv.innerHTML = '<div class="no-results">No results found</div>';
-                            return;
-                        }
-                        
-                        // Create result cards
-                        let resultsHtml = '';
-                        data.results.forEach(result => {
-                            resultsHtml += `
-                                <div class="result-card">
-                                    <h3 class="result-title">${result.title || 'No Title'}</h3>
-                                    <p class="result-url">${result.url}</p>
-                                    <p class="result-description">${result.description || 'No description available'}</p>
-                                </div>
-                            `;
-                        });
-                        
-                        resultsDiv.innerHTML = resultsHtml;
-                    })
-                    .catch(error => {
-                        loadingDiv.style.display = 'none';
-                        resultsDiv.innerHTML = `<div class="no-results">Error: ${error.message}</div>`;
-                    });
-            }
+            // Show the selected tab content
+            document.getElementById(tabName + '-tab').classList.add('active');
             
-            // Add event listeners
-            searchButton.addEventListener('click', performSearch);
-            searchInput.addEventListener('keypress', function(e) {
-                if (e.key === 'Enter') {
-                    performSearch();
-                }
-            });
+            // Add active class to the clicked tab
+            document.querySelector(`.tab[onclick="showTab('${tabName}')"]`).classList.add('active');
+        }
+        
+        function performSearch() {
+            const query = document.getElementById('search-input').value.trim();
+            if (!query) return;
             
-            // Set up URL submission
-            const urlInput = document.getElementById('url-input');
-            const submitUrlButton = document.getElementById('submit-url-button');
-            const maxDepthInput = document.getElementById('max-depth');
-            const maxUrlsInput = document.getElementById('max-urls');
-            const urlSubmissionResult = document.getElementById('url-submission-result');
+            const resultsContainer = document.getElementById('search-results');
+            const loadingSpinner = document.getElementById('search-loading');
             
-            submitUrlButton.addEventListener('click', function() {
-                const url = urlInput.value.trim();
-                if (!url) {
-                    urlSubmissionResult.innerHTML = '<p style="color: red;">Please enter a URL</p>';
-                    return;
-                }
-                
-                const maxDepth = maxDepthInput.value;
-                const maxUrls = maxUrlsInput.value;
-                
-                // Disable button during submission
-                submitUrlButton.disabled = true;
-                urlSubmissionResult.innerHTML = '<p>Submitting URL...</p>';
-                
-                // Submit URL for crawling
-                fetch('/submit-url', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        url: url,
-                        max_depth: maxDepth,
-                        max_urls_per_domain: maxUrls
-                    })
-                })
+            // Show loading spinner
+            loadingSpinner.style.display = 'flex';
+            resultsContainer.innerHTML = '';
+            
+            // Perform search request
+            fetch('/search?q=' + encodeURIComponent(query))
                 .then(response => response.json())
                 .then(data => {
-                    submitUrlButton.disabled = false;
-                    if (data.success) {
-                        urlSubmissionResult.innerHTML = `<p style="color: green;">${data.message}</p>`;
-                        urlInput.value = '';
-                    } else {
-                        urlSubmissionResult.innerHTML = `<p style="color: red;">${data.message}</p>`;
+                    // Hide loading spinner
+                    loadingSpinner.style.display = 'none';
+                    
+                    if (data.count === 0 || !data.results || data.results.length === 0) {
+                        resultsContainer.innerHTML = `<p>No results found for "${query}"</p>`;
+                        return;
                     }
+                    
+                    let resultsHtml = `<p>Found ${data.count} results for "${query}"</p>`;
+                    
+                    data.results.forEach(result => {
+                        resultsHtml += `
+                            <div class="result-item">
+                                <h3><a href="${result.url}" target="_blank">${highlightTerms(result.title || 'No title', query)}</a></h3>
+                                <div class="url">${highlightTerms(result.url, query)}</div>
+                                <div class="description">${highlightTerms(result.description || 'No description available', query)}</div>
+                            </div>
+                        `;
+                    });
+                    resultsContainer.innerHTML = resultsHtml;
                 })
                 .catch(error => {
-                    submitUrlButton.disabled = false;
-                    urlSubmissionResult.innerHTML = `<p style="color: red;">Error: ${error.message}</p>`;
+                    loadingSpinner.style.display = 'none';
+                    resultsContainer.innerHTML = 
+                        '<p class="error">An error occurred while searching. Please try again later.</p>';
                 });
+        }
+        
+        function highlightTerms(text, query) {
+            if (!text) return '';
+            
+            const terms = query.split(' ').filter(term => term.length > 2);
+            let result = text;
+            
+            terms.forEach(term => {
+                const regex = new RegExp('(' + term + ')', 'gi');
+                result = result.replace(regex, '<span class="highlight">$1</span>');
             });
             
-            // Update stats periodically
-            function updateStats() {
-                fetch('/stats')
-                    .then(response => response.json())
-                    .then(data => {
-                        document.querySelectorAll('.stat-item').forEach((item, index) => {
-                            const statValue = item.querySelector('.stat-value');
-                            if (index === 0) statValue.textContent = data.urls_in_frontier;
-                            if (index === 1) statValue.textContent = data.urls_indexed;
-                            if (index === 2) statValue.textContent = data.active_crawlers;
-                        });
-                    })
-                    .catch(error => console.error('Error updating stats:', error));
-            }
-            
-            // Update stats every 30 seconds
-            updateStats(); // Initial update
-            setInterval(updateStats, 30000);
+            return result;
+        }
+        
+        function submitUrls() {
+            const urlsText = document.getElementById('url-input').value.trim();
+            const maxDepth = document.getElementById('max-depth').value;
+            const maxUrls = document.getElementById('max-urls').value;
+            if (!urlsText) { alert('Please enter at least one URL'); return; }
+            document.getElementById('url-results-heading').textContent = 'Submitting URLs...';
+            document.getElementById('url-results').style.display = 'block';
+            fetch('/submit-urls', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: `urls=${encodeURIComponent(urlsText)}&max_depth=${encodeURIComponent(maxDepth)}&max_urls_per_domain=${encodeURIComponent(maxUrls)}`
+            })
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('url-results-heading').textContent = data.message;
+                const submittedUrlsList = document.getElementById('submitted-urls');
+                submittedUrlsList.innerHTML = '';
+                if (data.submitted_urls && data.submitted_urls.length > 0) {
+                    document.getElementById('submitted-urls-container').style.display = 'block';
+                    data.submitted_urls.forEach(url => {
+                        const li = document.createElement('li');
+                        li.innerHTML = `<span style="color:#388e3c;">✔</span> ${url}`;
+                        submittedUrlsList.appendChild(li);
+                    });
+                } else {
+                    document.getElementById('submitted-urls-container').style.display = 'none';
+                }
+                const invalidUrlsList = document.getElementById('invalid-urls');
+                invalidUrlsList.innerHTML = '';
+                if (data.invalid_urls && data.invalid_urls.length > 0) {
+                    document.getElementById('invalid-urls-container').style.display = 'block';
+                    data.invalid_urls.forEach(url => {
+                        const li = document.createElement('li');
+                        li.innerHTML = `<span style="color:#d32f2f;">✖</span> ${url}`;
+                        invalidUrlsList.appendChild(li);
+                    });
+                } else {
+                    document.getElementById('invalid-urls-container').style.display = 'none';
+                }
+                const failedUrlsList = document.getElementById('failed-urls');
+                failedUrlsList.innerHTML = '';
+                if (data.failed_urls && data.failed_urls.length > 0) {
+                    document.getElementById('failed-urls-container').style.display = 'block';
+                    data.failed_urls.forEach(url => {
+                        const li = document.createElement('li');
+                        li.innerHTML = `<span style="color:#d32f2f;">✖</span> ${url}`;
+                        failedUrlsList.appendChild(li);
+                    });
+                } else {
+                    document.getElementById('failed-urls-container').style.display = 'none';
+                }
+            })
+            .catch(error => {
+                document.getElementById('url-results-heading').textContent = 
+                    'An error occurred while submitting URLs. Please try again later.';
+            });
+        }
+        
+        function refreshStats() {
+            fetch('/stats')
+                .then(response => response.json())
+                .then(data => {
+                    document.querySelector('.stat-card:nth-child(1) .stat-value').textContent = data.urls_in_frontier;
+                    document.querySelector('.stat-card:nth-child(2) .stat-value').textContent = data.urls_indexed;
+                    document.querySelector('.stat-card:nth-child(3) .stat-value').textContent = data.active_crawlers;
+                    document.querySelector('.stat-card:nth-child(4) .stat-value').textContent = data.last_updated;
+                });
+        }
+        
+        function toggleDarkMode() {
+            document.body.classList.toggle('dark');
+            document.querySelector('.toggle-dark').textContent = document.body.classList.contains('dark') ? '☀️ Light Mode' : '🌙 Dark Mode';
+        }
+        
+        document.getElementById('search-input').addEventListener('keypress', function(event) {
+            if (event.key === 'Enter') performSearch();
         });
     </script>
 </body>

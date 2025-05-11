@@ -124,7 +124,9 @@ class WebSpider(scrapy.Spider):
             discovered_urls = []
             for href in response.css('a::attr(href)').getall():
                 discovered_url = response.urljoin(href)
-                discovered_urls.append(normalize_url(discovered_url))
+                # Only keep http(s) URLs
+                if discovered_url.startswith('http://') or discovered_url.startswith('https://'):
+                    discovered_urls.append(normalize_url(discovered_url))
             
             # Store the result
             self.results.append({
@@ -233,7 +235,7 @@ class CrawlerNode:
         self.settings = get_project_settings()
         self.settings.update({
             'USER_AGENT': 'DistributedCrawler/1.0',
-            'ROBOTSTXT_OBEY': True,
+            'ROBOTSTXT_OBEY': False,
             'DOWNLOAD_DELAY': 1.0,  # Basic politeness - 1 second delay
             'CONCURRENT_REQUESTS': 1,  # Start with just 1 concurrent request
             'LOG_LEVEL': 'ERROR',  # Only show errors, not info messages
@@ -349,6 +351,17 @@ class CrawlerNode:
         """Stop the crawler node."""
         print(f"Stopping crawler node: {self.crawler_id}")
         self.running = False
+        # Explicitly mark as stopped in DynamoDB
+        try:
+            table = self.dynamodb.Table('crawler-status')
+            table.update_item(
+                Key={'crawler_id': self.crawler_id},
+                UpdateExpression="SET #status = :status",
+                ExpressionAttributeNames={'#status': 'status'},
+                ExpressionAttributeValues={':status': 'stopped'}
+            )
+        except Exception as e:
+            print(f"Error updating crawler status on stop: {e}")
     
     def _register_with_master(self):
         """Register this crawler with the master node."""
@@ -585,11 +598,18 @@ class CrawlerNode:
     def _handle_task_failure(self, task_id, task, error_message):
         """Handle a failed task."""
         try:
+            url = task.get('url')
+            job_id = task.get('job_id')
+            if not url or not job_id:
+                logger.error(f"Cannot update url-frontier for failure: url={url}, job_id={job_id}")
+                return  # Do not proceed if either is missing
+
+            frontier_table = self.dynamodb.Table('url-frontier')
             # Record failure in DynamoDB
-            self.dynamodb.Table('url-frontier').update_item(
+            frontier_table.update_item(
                 Key={
-                    'url': task['url'],
-                    'job_id': task['job_id']
+                    'url': url,
+                    'job_id': job_id
                 },
                 UpdateExpression="SET #status = :status, error_message = :error, retry_count = if_not_exists(retry_count, :zero) + :one",
                 ExpressionAttributeNames={
@@ -639,21 +659,6 @@ class CrawlerNode:
                 logger.warning(f"URL missing scheme, adding https://: {url}")
                 url = f"https://{url}"
             
-            # Correct common typos
-            common_typos = {
-                'meduim.com': 'medium.com',
-                'gogle.com': 'google.com',
-                'facbook.com': 'facebook.com',
-                'amazn.com': 'amazon.com',
-                'wikipdia.org': 'wikipedia.org'
-            }
-            
-            for typo, correction in common_typos.items():
-                if typo in url:
-                    corrected_url = url.replace(typo, correction)
-                    logger.warning(f"Corrected URL typo: {url} -> {corrected_url}")
-                    url = corrected_url
-            
             return url
             # Update the task URL
             task['url'] = url
@@ -664,10 +669,6 @@ class CrawlerNode:
             # Get the URL and job_id from the task
             url = result.get('url')
             job_id = task.get('job_id', 'unknown')
-            
-            # Ensure job_id has the correct format
-            if not job_id.startswith('job-'):
-                job_id = f"job-{job_id}"
             
             logger.info(f"Preparing result for URL: {url}, job_id: {job_id}")
             
@@ -716,7 +717,8 @@ class CrawlerNode:
                 'title': content.get('title', ''),
                 'discovered_urls': result.get('discovered_urls', []),
                 's3_key': content_key,
-                'depth': result.get('depth', 0)
+                'depth': result.get('depth', 0),
+                'content': content
             }
             
             # Send the result to the master node
@@ -745,19 +747,18 @@ class CrawlerNode:
         """
         try:
             frontier_table = self.dynamodb.Table('url-frontier')
-            
             job_id = task.get('job_id')
             if not job_id:
-                job_id = f"job-{uuid.uuid4()}"
-                logger.warning(f"Missing job_id for completed URL: {url}, generated new one: {job_id}")
-            
+                logger.error(f"Cannot update url-frontier: missing job_id for URL: {url}")
+                return  # Do not proceed if job_id is missing
+
+            logger.debug(f"Updating url-frontier with url={url}, job_id={job_id}")
             update_expression = """
                 SET #status = :status, 
                     completed_at = :completed_at, 
                     crawler_id = :crawler_id,
                     last_updated = :last_updated
             """
-            
             frontier_table.update_item(
                 Key={
                     'url': url,
@@ -776,13 +777,9 @@ class CrawlerNode:
                 ReturnValues="ALL_NEW"
             )
             logger.info(f"Successfully updated URL frontier for completed URL: {url}")
-        except self.dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
-            logger.error(f"Conditional check failed when updating URL {url}")
-            raise
         except Exception as e:
             logger.error(f"Error updating URL frontier for completed URL {url}: {str(e)}")
             logger.error(traceback.format_exc())
-            raise
 
     def _update_url_frontier_after_failure(self, url, task, error_message):
         """

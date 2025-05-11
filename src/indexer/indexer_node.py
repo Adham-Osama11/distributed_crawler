@@ -54,6 +54,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("indexer")
 
+def safe_decimal(obj):
+    """Recursively convert all floats in a dict/list to Decimal."""
+    if isinstance(obj, float):
+        return Decimal(str(obj))
+    elif isinstance(obj, dict):
+        return {k: safe_decimal(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [safe_decimal(i) for i in obj]
+    else:
+        return obj
+
 class EnhancedTextProcessor:
     """Enhanced text processing with NLTK."""
     def __init__(self):
@@ -319,6 +330,32 @@ class WhooshIndex:
                 logger.error(f"Error saving index to S3: {e}")
                 logger.error(traceback.format_exc())
                 return None
+                
+    def check_index_integrity(self):
+        """Check the integrity of the index."""
+        logger.info("Checking index integrity")
+        with self.lock:
+            try:
+                # Verify the index exists and can be opened
+                if not os.path.exists(self.index_dir) or not os.listdir(self.index_dir):
+                    logger.warning("Index directory is empty or doesn't exist")
+                    return False
+                
+                # Try to open the index and perform a simple search
+                with self.ix.searcher() as searcher:
+                    # Create a parser with the schema
+                    parser = QueryParser("content", schema=self.ix.schema)
+                    # Parse a simple query
+                    query = parser.parse("test")
+                    # Try to search
+                    results = searcher.search(query, limit=1)
+                    # If we get here, the index is valid
+                    logger.info("Index integrity check passed")
+                    return True
+            except Exception as e:
+                logger.error(f"Index integrity check failed: {e}")
+                logger.error(traceback.format_exc())
+                return False
     
     def load_from_s3(self, s3_client, bucket_name, s3_key):
         """Load the index from S3."""
@@ -574,20 +611,44 @@ class IndexerNode:
         logger.debug("Sending heartbeat")
         try:
             timestamp = datetime.now(timezone.utc).isoformat()
+            
+            # Convert all numeric values to Decimal
+            def to_decimal(value):
+                if isinstance(value, (int, float)):
+                    return Decimal(str(value))
+                return value
+            
+            # Get all numeric values and convert them
+            memory_usage = to_decimal(self._get_memory_usage())
+            index_size = to_decimal(self._get_index_size())
+            processed_count = to_decimal(self.processed_count)
+            document_count = to_decimal(self.document_count)
+            failed_tasks_count = to_decimal(len(self.failed_tasks))
+            
+            # Create status dictionary with all numeric values as Decimal
             status = {
                 'indexer_id': self.indexer_id,
                 'timestamp': timestamp,
                 'status': 'active',
-                'processed_count': Decimal(str(self.processed_count)),
-                'document_count': Decimal(str(self.document_count)),
-                'failed_tasks': Decimal(str(len(self.failed_tasks))),
-                'last_successful_task': self.last_successful_task if hasattr(self, 'last_successful_task') else None,
-                'memory_usage': Decimal(str(self._get_memory_usage())),
-                'index_size': Decimal(str(self._get_index_size()))
+                'processed_count': processed_count,
+                'document_count': document_count,
+                'failed_tasks': failed_tasks_count,
+                'memory_usage': memory_usage,
+                'index_size': index_size
             }
+            
+            # Add last_successful_task only if it exists and is not None
+            if hasattr(self, 'last_successful_task') and self.last_successful_task is not None:
+                status['last_successful_task'] = to_decimal(self.last_successful_task)
+            
+            # Debug log the status dictionary
+            logger.debug(f"Status dictionary before DynamoDB: {status}")
+            
+            # Send to DynamoDB
             self.dynamodb.Table('indexer-status').put_item(Item=status)
             self.last_heartbeat = time.time()
-            logger.debug(f"Heartbeat sent at {timestamp}, status: {status}")
+            logger.debug(f"Heartbeat sent at {timestamp}")
+            
         except Exception as e:
             logger.error(f"Error sending heartbeat: {e}")
             logger.error(traceback.format_exc())
@@ -729,14 +790,7 @@ class IndexerNode:
 
     def _verify_index_integrity(self):
         """Verify the integrity of the index."""
-        try:
-            with self.index.ix.searcher() as searcher:
-                # Try a simple search to verify index is working
-                searcher.search(self.index.ix.schema.parse_query("test"))
-                return True
-        except Exception as e:
-            logger.error(f"Index integrity check failed: {e}")
-            return False
+        return self.index.check_index_integrity()
 
     def _reload_index_from_s3(self):
         """Reload the index from S3."""
@@ -939,44 +993,55 @@ class IndexerNode:
 
     def start(self):
         """Start the indexer node."""
-        logger.info("Starting indexer node")
-        self.running = True
+        logger.info(f"Starting indexer node: {self.indexer_id}")
         
         # Start heartbeat thread
+        self.running = True
         logger.debug("Starting heartbeat thread")
         self.heartbeat_thread.start()
+        logger.debug("Starting recovery thread")
+        self.recovery_thread.start()
         
-        # Main indexing loop
-        logger.info("Entering main indexing loop")
-        while self.running:
-            try:
-                # Get a task from the queue
-                logger.debug("Attempting to get task from queue")
-                task = self._get_task()
-                
-                if task:
-                    # Process the task
-                    logger.info(f"Processing task for URL: {task.get('url', 'unknown')}")
-                    self._process_task(task)
+        try:
+            # Main indexing loop
+            logger.info("Entering main indexing loop")
+            while self.running:
+                try:
+                    # Get a task from the queue
+                    logger.debug("Attempting to get task from queue")
+                    task = self._get_task()
                     
-                    # Increment counter and save periodically
-                    self.processed_count += 1
-                    logger.debug(f"Processed count: {self.processed_count}")
-                    if self.processed_count % self.save_interval == 0:
-                        # Save to S3
-                        logger.info(f"Save interval reached ({self.save_interval}), saving index to S3")
-                        index_key = self.index.save_to_s3(self.s3, INDEX_DATA_BUCKET)
-                        if index_key:
-                            self._save_index_metadata(index_key)
-                        logger.info(f"Index saved after processing {self.processed_count} documents")
-                else:
-                    # No tasks available, wait a bit
-                    logger.debug("No tasks available, waiting")
+                    if task:
+                        # Process the task
+                        logger.info(f"Processing task for URL: {task.get('url', 'unknown')}")
+                        self._process_task(task)
+                        
+                        # Increment counter and save periodically
+                        self.processed_count += 1
+                        logger.debug(f"Processed count: {self.processed_count}")
+                        if self.processed_count % self.save_interval == 0:
+                            # Save to S3
+                            logger.info(f"Save interval reached ({self.save_interval}), saving index to S3")
+                            index_key = self.index.save_to_s3(self.s3, INDEX_DATA_BUCKET)
+                            if index_key:
+                                self._save_index_metadata(index_key)
+                            logger.info(f"Index saved after processing {self.processed_count} documents")
+                    else:
+                        # No tasks available, wait a bit
+                        logger.debug("No tasks available, waiting")
+                        time.sleep(1)
+                except KeyboardInterrupt:
+                    logger.info("Keyboard interrupt received, stopping indexer...")
+                    break
+                except Exception as e:
+                    logger.error(f"Error in indexer main loop: {e}")
+                    logger.error(traceback.format_exc())
                     time.sleep(1)
-            except Exception as e:
-                logger.error(f"Error in indexer main loop: {e}")
-                logger.error(traceback.format_exc())
-                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Keyboard interrupt received, stopping indexer...")
+        finally:
+            # Clean up
+            self.stop()
     
     def stop(self):
         """Stop the indexer node."""
@@ -984,13 +1049,22 @@ class IndexerNode:
         self.running = False
         
         # Save the index before stopping
-        logger.info("Saving index before stopping")
-        index_key = self.index.save_to_s3(self.s3, INDEX_DATA_BUCKET)
-        if index_key:
-            self._save_index_metadata(index_key)
-            logger.info("Final index saved successfully")
-        else:
-            logger.warning("Failed to save final index")
+        if self.processed_count > 0:
+            try:
+                logger.info("Saving index before shutdown...")
+                index_key = self.index.save_to_s3(self.s3, INDEX_DATA_BUCKET)
+                if index_key:
+                    self._save_index_metadata(index_key)
+                    logger.info("Final index saved successfully")
+                else:
+                    logger.warning("Failed to save final index")
+            except KeyboardInterrupt:
+                logger.warning("Keyboard interrupt during final save, attempting to continue shutdown...")
+            except Exception as e:
+                logger.error(f"Error saving index during shutdown: {e}")
+                logger.error(traceback.format_exc())
+        
+        logger.info("Indexer node stopped")
     
     def _get_task(self):
         """Get a task from the index task queue."""
@@ -1126,6 +1200,7 @@ class IndexerNode:
             logger.error(f"Error recording indexed document: {e}")
             logger.error(traceback.format_exc())
             return False
+
     def add_to_index(self, document):
         """
         Add a document to the search index.
@@ -1197,15 +1272,22 @@ class IndexerNode:
           return []
 
 if __name__ == "__main__":
-    # Create and start an indexer node
-    logger.info("Creating indexer node")
-    indexer = IndexerNode()
     try:
+        # Create and start an indexer node
+        logger.info("Creating indexer node")
+        indexer = IndexerNode()
         indexer.start()
     except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received, stopping indexer")
-        indexer.stop()
+        logger.info("Keyboard interrupt received in main thread")
     except Exception as e:
         logger.critical(f"Unhandled exception in indexer: {e}")
         logger.critical(traceback.format_exc())
-        indexer.stop()
+    finally:
+        # Make sure we attempt to stop the indexer even if there's an exception
+        try:
+            if 'indexer' in locals():
+                logger.info("Attempting to stop indexer...")
+                indexer.stop()
+        except Exception as e:
+            logger.error(f"Error stopping indexer: {e}")
+            logger.error(traceback.format_exc())

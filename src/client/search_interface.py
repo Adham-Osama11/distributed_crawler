@@ -8,12 +8,22 @@ import sys
 from flask import Flask, render_template, request, jsonify
 import requests
 from datetime import datetime
+import tempfile
+import shutil
+import uuid
+
+# Add the project root directory to Python path
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(project_root)
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from indexer.indexer_node import WhooshIndex
+
+app = Flask(__name__)
 
 # Add the parent directory to the path so we can import common modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.config import AWS_REGION, CRAWL_DATA_BUCKET, INDEX_DATA_BUCKET 
-
-app = Flask(__name__)
+from common.config import AWS_REGION, CRAWL_DATA_BUCKET, INDEX_DATA_BUCKET, MASTER_COMMAND_QUEUE 
 
 # Initialize AWS clients
 dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
@@ -96,39 +106,14 @@ def track_search_query(query, results_count):
 
 @app.route('/search')
 def search():
-    """Handle search requests with caching."""
+    """Handle search requests using dashboard-style DynamoDB logic."""
     query = request.args.get('q', '')
     if not query:
-        return jsonify({'results': [], 'message': 'Please enter a search query'})
-    
+        return jsonify({'results': [], 'count': 0, 'query': query, 'message': 'Please enter a search query'})
     print(f"Received search query: {query}")
-    
-    # Check cache first
-    cached_results = get_cached_results(query)
-    if cached_results:
-        print(f"Returning cached results for query: {query}")
-        # Track cached query
-        track_search_query(query, len(cached_results))
-        return jsonify({
-            'results': cached_results,
-            'count': len(cached_results),
-            'query': query,
-            'timestamp': datetime.now().isoformat(),
-            'cached': True
-        })
-    
-    # If not in cache, perform search
-    results = perform_search(query)
-    
-    # Cache the results
-    cache_results(query, results)
-    
-    # Track the search query
-    track_search_query(query, len(results))
-    
-    print(f"Found {len(results)} results for query: {query}")
-    
-    # Return results as JSON
+    search_result = search_indexed_content(query)
+    results = search_result.get('results', [])
+    print(f"Results: {results}")
     return jsonify({
         'results': results,
         'count': len(results),
@@ -207,52 +192,94 @@ def get_active_crawlers():
         print(f"Error getting active crawlers: {e}")
         return []
 
-def perform_search(query):
+def perform_search(query, max_results=10):
     """
-    Perform a search against the index with improved relevance scoring.
+    Search the indexed-documents and crawl-metadata tables in DynamoDB for the query.
+    Args:
+        query (str): The search query
+        max_results (int): Maximum number of results to return
+    Returns:
+        list: Search results
     """
     try:
-        # First, try to get the latest index metadata
-        index_metadata = get_latest_index_metadata()
-        
-        # Preprocess the query for better matching
-        processed_query = preprocess_query(query)
-        
+        print(f"Searching DynamoDB for: {query}")
         results = []
-        if index_metadata:
-            # Use the S3-stored index for searching
-            results = search_using_s3_index(processed_query, index_metadata)
-        
-        # If no results from S3 index, try DynamoDB
-        if not results:
-            results = search_using_dynamodb(processed_query)
-            
-        # Apply additional ranking factors
-        results = apply_ranking_factors(results, processed_query)
-            
-        # If still no results, return a default "no results" message
-        if not results:
-            print("No results found for query: " + query)
-            # Create a dummy result to avoid "No results found" message
-            results = [{
-                'url': '#',
-                'title': 'No exact matches found',
-                'description': 'Try a different search term or submit a URL for crawling below.',
-                'indexed_at': datetime.now().isoformat(),
-                'score': 0
-            }]
-            
-        return results
+        # First try the indexed-documents table
+        try:
+            table = dynamodb.Table('indexed-documents')
+            response = table.scan()
+            for item in response.get('Items', []):
+                score = 0
+                if query.lower() in item.get('title', '').lower():
+                    score = 3
+                elif query.lower() in item.get('description', '').lower():
+                    score = 2
+                if score > 0:
+                    results.append({
+                        'url': item['url'],
+                        'title': item.get('title', 'No title'),
+                        'description': item.get('description', 'No description available'),
+                        'indexed_at': item.get('indexed_at', 'Unknown'),
+                        'score': score
+                    })
+            results.sort(key=lambda x: x['score'], reverse=True)
+            if results:
+                return results[:max_results]
+        except Exception as e:
+            print(f"Error searching indexed-documents: {e}")
+        # If no results or error, try crawl-metadata table
+        try:
+            table = dynamodb.Table('crawl-metadata')
+            response = table.scan()
+            for item in response.get('Items', []):
+                score = 0
+                if query.lower() in item.get('title', '').lower():
+                    score = 3
+                elif query.lower() in item.get('description', '').lower():
+                    score = 2
+                if score > 0:
+                    results.append({
+                        'url': item['url'],
+                        'title': item.get('title', 'No title'),
+                        'description': item.get('description', 'No description available'),
+                        'indexed_at': item.get('crawl_time', 'Unknown'),
+                        'score': score
+                    })
+            results.sort(key=lambda x: x['score'], reverse=True)
+            return results[:max_results]
+        except Exception as e:
+            print(f"Error searching crawl-metadata: {e}")
+        return []
     except Exception as e:
-        print(f"Error performing search: {e}")
-        # Return a fallback result instead of empty list
-        return [{
-            'url': '#',
-            'title': 'Search Error',
-            'description': f'An error occurred while searching: {str(e)}',
-            'indexed_at': datetime.now().isoformat(),
-            'score': 0
-        }]
+        print(f"Error searching using DynamoDB: {e}")
+        return []
+
+def download_whoosh_index_from_s3(local_dir):
+    """
+    Download the Whoosh index from S3 to a local directory.
+    Args:
+        local_dir (str): Local directory to download the index to
+    """
+    try:
+        print(f"Downloading Whoosh index from S3 bucket: {INDEX_DATA_BUCKET}")
+        response = s3.list_objects_v2(Bucket=INDEX_DATA_BUCKET, Prefix='whoosh_index/')
+        if 'Contents' not in response:
+            print(f"No index files found in S3 bucket: {INDEX_DATA_BUCKET}")
+            return False
+        for obj in response['Contents']:
+            key = obj['Key']
+            local_path = os.path.join(local_dir, os.path.relpath(key, 'whoosh_index/'))
+            local_dir_path = os.path.dirname(local_path)
+            os.makedirs(local_dir_path, exist_ok=True)
+            print(f"Downloading {key} to {local_path}")
+            s3.download_file(INDEX_DATA_BUCKET, key, local_path)
+        print(f"Successfully downloaded Whoosh index to {local_dir}")
+        return True
+    except Exception as e:
+        print(f"Error downloading Whoosh index from S3: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 def preprocess_query(query):
     """Preprocess the query for better search results."""
@@ -577,50 +604,108 @@ def get_url_metadata(url):
         print(f"Error getting URL metadata: {e}")
         return None
 
-@app.route('/submit-url', methods=['POST'])
-def submit_url():
-    """Handle URL submission for crawling."""
-    data = request.get_json()
-    if not data or 'url' not in data:
-        return jsonify({'success': False, 'message': 'URL is required'}), 400
-    
-    url = data['url']
-    max_depth = data.get('max_depth', 3)
-    max_urls_per_domain = data.get('max_urls_per_domain', 100)
-    
+@app.route('/submit-urls', methods=['POST'])
+def submit_urls():
+    """Handle submission of multiple URLs to crawl by sending them to the master node."""
     try:
-        # Create an SQS client
-        sqs = boto3.client('sqs', region_name=AWS_REGION)
+        # Get URLs from form
+        urls_text = request.form.get('urls', '')
+        max_depth = int(request.form.get('max_depth', 3))
+        max_urls_per_domain = int(request.form.get('max_urls_per_domain', 100))
         
-        # Get the crawl task queue URL
-        response = sqs.get_queue_url(QueueName='crawl-task-queue')
-        queue_url = response['QueueUrl']
+        # Split by newline, comma, or space and clean up
+        urls = []
+        for separator in ['\n', ',', ' ']:
+            if separator in urls_text:
+                urls.extend([url.strip() for url in urls_text.split(separator) if url.strip()])
+                break
+        else:
+            # If no separator found, treat as a single URL
+            if urls_text.strip():
+                urls = [urls_text.strip()]
         
-        # Create a task message
-        task = {
-            'action': 'crawl_url',
+        # Validate URLs
+        valid_urls = []
+        invalid_urls = []
+        
+        for url in urls:
+            # Ensure URL has a scheme
+            if not url.startswith(('http://', 'https://')):
+                url = 'https://' + url
+            
+            # Basic validation
+            import re
+            url_pattern = re.compile(
+                r'^(https?://)'  # http:// or https://
+                r'([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+' # domain
+                r'[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?' # domain
+                r'(/[a-zA-Z0-9._~:/?#[\]@!$&\'()*+,;=]*)?' # path
+                r'$'
+            )
+            
+            if url_pattern.match(url):
+                valid_urls.append(url)
+            else:
+                invalid_urls.append(url)
+        
+        # Submit valid URLs to the master node
+        submitted_urls = []
+        for url in valid_urls:
+            if submit_url_to_master(url, max_depth, max_urls_per_domain):
+                submitted_urls.append(url)
+        
+        # Return results
+        return jsonify({
+            'success': True,
+            'message': f'Submitted {len(submitted_urls)} URLs to master node',
+            'submitted_urls': submitted_urls,
+            'invalid_urls': invalid_urls,
+            'failed_urls': [url for url in valid_urls if url not in submitted_urls]
+        })
+    
+    except Exception as e:
+        import traceback
+        print(f"Error submitting URLs: {e}")
+        print(traceback.format_exc())
+        return jsonify({
+            'success': False,
+            'message': f'Error submitting URLs: {str(e)}'
+        }), 500
+
+def submit_url_to_master(url, max_depth, max_urls_per_domain):
+    """Submit a URL to the master node for crawling."""
+    try:
+        # Create a message for the master node
+        message = {
+            'action': 'start_crawl',
             'url': url,
             'max_depth': max_depth,
             'max_urls_per_domain': max_urls_per_domain,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
+            'source': 'web_interface'
         }
         
-        # Send the message to the queue
+        # Send to the master node queue
+        sqs = boto3.client('sqs', region_name=AWS_REGION)
+        
+        # Get the master node queue URL
+        queue_url_response = sqs.get_queue_url(QueueName=MASTER_COMMAND_QUEUE)
+        queue_url = queue_url_response['QueueUrl']
+        
+        # Send the message
         sqs.send_message(
             QueueUrl=queue_url,
-            MessageBody=json.dumps(task)
+            MessageBody=json.dumps(message)
         )
         
-        return jsonify({
-            'success': True, 
-            'message': f'URL submitted for crawling: {url}',
-            'url': url,
-            'max_depth': max_depth,
-            'max_urls_per_domain': max_urls_per_domain
-        })
+        print(f"Successfully submitted URL to master node: {url}")
+        return True
+    
     except Exception as e:
-        print(f"Error submitting URL: {e}")
-        return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
+        print(f"Error submitting URL to master node: {url}, error: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return False
 
 @app.route('/debug-info',endpoint='debug_system_v1')
 def debug_system():
@@ -852,378 +937,87 @@ def debug_tables():
             'timestamp': datetime.now().isoformat()
         })
 
+def search_indexed_content(query):
+    """Search for indexed content in DynamoDB."""
+    try:
+        if not query:
+            return {"results": []}
+            
+        # First try the indexed-documents table
+        try:
+            table = dynamodb.Table('indexed-documents')
+            
+            # This is a simplified search that just looks for the query in the title
+            response = table.scan()
+            
+            results = []
+            for item in response.get('Items', []):
+                # Simple scoring - if query is in title or description, give higher score
+                score = 0
+                if query.lower() in item.get('title', '').lower():
+                    score = 3
+                elif query.lower() in item.get('description', '').lower():
+                    score = 2
+                
+                if score > 0:
+                    results.append({
+                        'url': item['url'],
+                        'title': item.get('title', 'No title'),
+                        'description': item.get('description', 'No description available'),
+                        'indexed_at': item.get('indexed_at', 'Unknown'),
+                        'score': score
+                    })
+            
+            # Sort by score
+            results.sort(key=lambda x: x['score'], reverse=True)
+            
+            if results:
+                return {"results": results}
+        except Exception as e:
+            print(f"Error searching indexed-documents: {e}")
+        
+        # If no results or error, try crawl-metadata table
+        try:
+            table = dynamodb.Table('crawl-metadata')
+            
+            response = table.scan()
+            
+            results = []
+            for item in response.get('Items', []):
+                # Simple scoring - if query is in title or description, give higher score
+                score = 0
+                if query.lower() in item.get('title', '').lower():
+                    score = 3
+                elif query.lower() in item.get('description', '').lower():
+                    score = 2
+                
+                if score > 0:
+                    results.append({
+                        'url': item['url'],
+                        'title': item.get('title', 'No title'),
+                        'description': item.get('description', 'No description available'),
+                        'indexed_at': item.get('crawl_time', 'Unknown'),
+                        'score': score
+                    })
+            
+            # Sort by score
+            results.sort(key=lambda x: x['score'], reverse=True)
+            
+            return {"results": results}
+        except Exception as e:
+            print(f"Error searching crawl-metadata: {e}")
+        
+        # If all else fails, return empty results
+        return {"results": []}
+    except Exception as e:
+        print(f"Error searching using DynamoDB: {e}")
+        return {"results": []}
+
 if __name__ == '__main__':
-    # Create templates directory if it doesn't exist
-    os.makedirs('templates', exist_ok=True)
-    
-    # Create the HTML template if it doesn't exist
-    template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'templates', 'search.html')
-    if not os.path.exists(template_path):
-        with open(template_path, 'w') as f:
-            f.write("""<!DOCTYPE html>
-<html>
-<head>
-    <title>Distributed Web Crawler - Search</title>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            margin: 0;
-            padding: 0;
-            background-color: #f5f5f5;
-        }
-        .container {
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-        .search-box {
-            text-align: center;
-            margin: 40px 0;
-        }
-        .search-input {
-            width: 70%;
-            padding: 10px;
-            font-size: 16px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-        }
-        .search-button {
-            padding: 10px 20px;
-            font-size: 16px;
-            background-color: #4285f4;
-            color: white;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-        }
-        .search-button:hover {
-            background-color: #3b78e7;
-        }
-        .results {
-            margin-top: 20px;
-        }
-        .result-card {
-            background-color: white;
-            border-radius: 4px;
-            padding: 15px;
-            margin-bottom: 15px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-        .result-title {
-            color: #1a0dab;
-            font-size: 18px;
-            margin: 0 0 5px 0;
-        }
-        .result-url {
-            color: #006621;
-            font-size: 14px;
-            margin: 0 0 10px 0;
-        }
-        .result-description {
-            color: #545454;
-            font-size: 14px;
-            margin: 0;
-        }
-        .stats {
-            display: flex;
-            justify-content: space-between;
-            background-color: white;
-            padding: 15px;
-            border-radius: 4px;
-            margin-bottom: 20px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-        .stat-item {
-            text-align: center;
-        }
-        .stat-value {
-            font-size: 24px;
-            font-weight: bold;
-            color: #4285f4;
-        }
-        .stat-label {
-            font-size: 14px;
-            color: #545454;
-        }
-        .loading {
-            text-align: center;
-            margin: 20px 0;
-            display: none;
-        }
-        .no-results {
-            text-align: center;
-            margin: 20px 0;
-            color: #545454;
-        }
-        /* Suggestions styling */
-        .suggestions {
-            position: absolute;
-            width: 70%;
-            max-height: 200px;
-            overflow-y: auto;
-            background-color: white;
-            border: 1px solid #ddd;
-            border-top: none;
-            border-radius: 0 0 4px 4px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            z-index: 10;
-        }
-        
-        .suggestion-item {
-            padding: 10px 15px;
-            cursor: pointer;
-            transition: background-color 0.2s;
-        }
-        
-        .suggestion-item:hover {
-            background-color: #f5f5f5;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1 style="text-align: center;">Distributed Web Crawler</h1>
-        
-        <div class="stats">
-            <div class="stat-item">
-                <div class="stat-value">{{ stats.urls_in_frontier }}</div>
-                <div class="stat-label">URLs in Frontier</div>
-            </div>
-            <div class="stat-item">
-                <div class="stat-value">{{ stats.urls_indexed }}</div>
-                <div class="stat-label">URLs Indexed</div>
-            </div>
-            <div class="stat-item">
-                <div class="stat-value">{{ stats.active_crawlers }}</div>
-                <div class="stat-label">Active Crawlers</div>
-            </div>
-        </div>
-        
-        <div class="search-box">
-            <input type="text" id="search-input" class="search-input" placeholder="Enter search query...">
-            <button id="search-button" class="search-button">Search</button>
-        </div>
-        
-        <div id="loading" class="loading">
-            <p>Searching...</p>
-        </div>
-        
-        <div id="results" class="results"></div>
-        
-        <!-- Add URL submission form -->
-        <div class="url-submission" style="margin-top: 40px; background-color: white; padding: 20px; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
-            <h2 style="text-align: center;">Submit URL for Crawling</h2>
-            <div style="display: flex; margin-bottom: 10px;">
-                <input type="text" id="url-input" class="search-input" placeholder="Enter URL to crawl..." style="flex-grow: 1; margin-right: 10px;">
-                <button id="submit-url-button" class="search-button">Submit</button>
-            </div>
-            <div style="display: flex; justify-content: space-between;">
-                <div>
-                    <label for="max-depth">Max Depth:</label>
-                    <input type="number" id="max-depth" min="1" max="5" value="3" style="width: 50px;">
-                </div>
-                <div>
-                    <label for="max-urls">Max URLs per Domain:</label>
-                    <input type="number" id="max-urls" min="10" max="500" value="100" style="width: 70px;">
-                </div>
-            </div>
-            <div id="url-submission-result" style="margin-top: 10px;"></div>
-        </div>
-    </div>
-    
-    <script>
-        document.addEventListener('DOMContentLoaded', function() {
-            const searchInput = document.getElementById('search-input');
-            const searchButton = document.getElementById('search-button');
-            const resultsDiv = document.getElementById('results');
-            const loadingDiv = document.getElementById('loading');
-            
-            // Set up suggestions
-            const suggestionsContainer = document.createElement('div');
-            suggestionsContainer.className = 'suggestions';
-            suggestionsContainer.style.display = 'none';
-            searchInput.parentNode.insertBefore(suggestionsContainer, searchInput.nextSibling);
-            
-            let debounceTimer;
-            
-            searchInput.addEventListener('input', function() {
-                const query = this.value.trim();
-                
-                // Clear previous timer
-                clearTimeout(debounceTimer);
-                
-                // Hide suggestions if query is too short
-                if (query.length < 2) {
-                    suggestionsContainer.style.display = 'none';
-                    return;
-                }
-                
-                // Debounce the API call
-                debounceTimer = setTimeout(() => {
-                    fetch(`/suggest?q=${encodeURIComponent(query)}`)
-                        .then(response => response.json())
-                        .then(suggestions => {
-                            // Clear previous suggestions
-                            suggestionsContainer.innerHTML = '';
-                            
-                            if (suggestions.length > 0) {
-                                // Create suggestion elements
-                                suggestions.forEach(suggestion => {
-                                    const div = document.createElement('div');
-                                    div.className = 'suggestion-item';
-                                    div.textContent = suggestion;
-                                    div.addEventListener('click', () => {
-                                        searchInput.value = suggestion;
-                                        suggestionsContainer.style.display = 'none';
-                                        document.getElementById('search-button').click();
-                                    });
-                                    suggestionsContainer.appendChild(div);
-                                });
-                                
-                                suggestionsContainer.style.display = 'block';
-                            } else {
-                                suggestionsContainer.style.display = 'none';
-                            }
-                        })
-                        .catch(error => {
-                            console.error('Error fetching suggestions:', error);
-                            suggestionsContainer.style.display = 'none';
-                        });
-                }, 300); // 300ms debounce
-            });
-            
-            // Hide suggestions when clicking outside
-            document.addEventListener('click', function(event) {
-                if (!searchInput.contains(event.target) && !suggestionsContainer.contains(event.target)) {
-                    suggestionsContainer.style.display = 'none';
-                }
-            });
-            
-            // Function to perform search
-            function performSearch() {
-                const query = searchInput.value.trim();
-                if (!query) {
-                    return;
-                }
-                
-                // Show loading indicator
-                loadingDiv.style.display = 'block';
-                resultsDiv.innerHTML = '';
-                
-                // Perform search
-                fetch(`/search?q=${encodeURIComponent(query)}`)
-                    .then(response => response.json())
-                    .then(data => {
-                        // Hide loading indicator
-                        loadingDiv.style.display = 'none';
-                        
-                        // Display results
-                        if (data.results.length === 0) {
-                            resultsDiv.innerHTML = '<div class="no-results">No results found</div>';
-                            return;
-                        }
-                        
-                        // Create result cards
-                        let resultsHtml = '';
-                        data.results.forEach(result => {
-                            resultsHtml += `
-                                <div class="result-card">
-                                    <h3 class="result-title">${result.title || 'No Title'}</h3>
-                                    <p class="result-url">${result.url}</p>
-                                    <p class="result-description">${result.description || 'No description available'}</p>
-                                </div>
-                            `;
-                        });
-                        
-                        resultsDiv.innerHTML = resultsHtml;
-                    })
-                    .catch(error => {
-                        loadingDiv.style.display = 'none';
-                        resultsDiv.innerHTML = `<div class="no-results">Error: ${error.message}</div>`;
-                    });
-            }
-            
-            // Add event listeners
-            searchButton.addEventListener('click', performSearch);
-            searchInput.addEventListener('keypress', function(e) {
-                if (e.key === 'Enter') {
-                    performSearch();
-                }
-            });
-            
-            // Set up URL submission
-            const urlInput = document.getElementById('url-input');
-            const submitUrlButton = document.getElementById('submit-url-button');
-            const maxDepthInput = document.getElementById('max-depth');
-            const maxUrlsInput = document.getElementById('max-urls');
-            const urlSubmissionResult = document.getElementById('url-submission-result');
-            
-            submitUrlButton.addEventListener('click', function() {
-                const url = urlInput.value.trim();
-                if (!url) {
-                    urlSubmissionResult.innerHTML = '<p style="color: red;">Please enter a URL</p>';
-                    return;
-                }
-                
-                const maxDepth = maxDepthInput.value;
-                const maxUrls = maxUrlsInput.value;
-                
-                // Disable button during submission
-                submitUrlButton.disabled = true;
-                urlSubmissionResult.innerHTML = '<p>Submitting URL...</p>';
-                
-                // Submit URL for crawling
-                fetch('/submit-url', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        url: url,
-                        max_depth: maxDepth,
-                        max_urls_per_domain: maxUrls
-                    })
-                })
-                .then(response => response.json())
-                .then(data => {
-                    submitUrlButton.disabled = false;
-                    if (data.success) {
-                        urlSubmissionResult.innerHTML = `<p style="color: green;">${data.message}</p>`;
-                        urlInput.value = '';
-                    } else {
-                        urlSubmissionResult.innerHTML = `<p style="color: red;">${data.message}</p>`;
-                    }
-                })
-                .catch(error => {
-                    submitUrlButton.disabled = false;
-                    urlSubmissionResult.innerHTML = `<p style="color: red;">Error: ${error.message}</p>`;
-                });
-            });
-            
-            // Update stats periodically
-            function updateStats() {
-                fetch('/stats')
-                    .then(response => response.json())
-                    .then(data => {
-                        document.querySelectorAll('.stat-item').forEach((item, index) => {
-                            const statValue = item.querySelector('.stat-value');
-                            if (index === 0) statValue.textContent = data.urls_in_frontier;
-                            if (index === 1) statValue.textContent = data.urls_indexed;
-                            if (index === 2) statValue.textContent = data.active_crawlers;
-                        });
-                    })
-                    .catch(error => console.error('Error updating stats:', error));
-            }
-            
-            // Update stats every 30 seconds
-            updateStats(); // Initial update
-            setInterval(updateStats, 30000);
-        });
-    </script>
-</body>
-</html>""")
-    
-    # Run the Flask app
-app.run(debug=True, port=5000)
+    import argparse
+    parser = argparse.ArgumentParser(description='Start the search interface')
+    parser.add_argument('--port', type=int, default=5000, help='Port to run the server on')
+    parser.add_argument('--debug', action='store_true', help='Run in debug mode')
+    args = parser.parse_args()
+    print(f"Starting search interface on port {args.port}")
+    app.run(host='0.0.0.0', port=args.port, debug=args.debug)

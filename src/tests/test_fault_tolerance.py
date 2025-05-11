@@ -1,173 +1,210 @@
-"""
-Test script for fault tolerance in the distributed web crawler.
-"""
-import sys
-import os
+import unittest
 import time
-import uuid
-import json
+import threading
+from unittest.mock import Mock, patch
 import boto3
-import subprocess
-import signal
-import psutil
-from datetime import datetime, timezone
+from moto import mock_sqs, mock_dynamodb, mock_s3
+from src.crawler.crawler_node import CrawlerNode
+from src.master.master_node import MasterNode
+from src.indexer.indexer_node import WhooshIndex
+from botocore.exceptions import ClientError
 
-# Add the parent directory to the path so we can import modules
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.config import AWS_REGION, CRAWL_TASK_QUEUE, CRAWL_RESULT_QUEUE
-
-def start_process(command):
-    """Start a process and return its process object."""
-    print(f"Starting process: {command}")
-    return subprocess.Popen(command, shell=True)
-
-def kill_process(process):
-    """Kill a process."""
-    print(f"Killing process with PID: {process.pid}")
-    if os.name == 'nt':  # Windows
-        process.kill()
-    else:  # Unix
-        os.kill(process.pid, signal.SIGKILL)
-
-def test_crawler_fault_tolerance():
-    """Test crawler node fault tolerance."""
-    print("\n=== Testing Crawler Node Fault Tolerance ===")
-    
-    # Start master node
-    master_process = start_process("python src\\master\\master_node.py")
-    time.sleep(5)  # Give master time to initialize
-    
-    # Start two crawler nodes
-    crawler1_id = f"test-crawler-{uuid.uuid4()}"
-    crawler2_id = f"test-crawler-{uuid.uuid4()}"
-    
-    crawler1_process = start_process(f"python src\\crawler\\crawler_node.py --crawler_id {crawler1_id}")
-    crawler2_process = start_process(f"python src\\crawler\\crawler_node.py --crawler_id {crawler2_id}")
-    time.sleep(5)  # Give crawlers time to initialize
-    
-    # Submit a URL for crawling
-    submit_process = start_process("python src\\client\\submit_url.py https://example.com")
-    time.sleep(10)  # Give time for crawling to start
-    
-    # Kill one crawler node to simulate failure
-    print("Simulating crawler node failure...")
-    kill_process(crawler1_process)
-    
-    # Wait for the master to detect the failure (should be 2*HEARTBEAT_INTERVAL)
-    print("Waiting for master to detect crawler failure...")
-    time.sleep(70)  # Assuming HEARTBEAT_INTERVAL is 30 seconds
-    
-    # Check if the master detected the failure
-    dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
-    crawler_status_table = dynamodb.Table('crawler-status')
-    
+def create_table_if_not_exists(dynamodb, table_name, key_schema, attribute_definitions, throughput):
     try:
-        response = crawler_status_table.get_item(
-            Key={'crawler_id': crawler1_id}
+        table = dynamodb.Table(table_name)
+        table.load()  # Will raise if table does not exist
+        print(f"Table {table_name} already exists.")
+        return table
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ResourceNotFoundException':
+            print(f"Creating table {table_name}...")
+            return dynamodb.create_table(
+                TableName=table_name,
+                KeySchema=key_schema,
+                AttributeDefinitions=attribute_definitions,
+                ProvisionedThroughput=throughput
+            )
+        else:
+            raise
+
+def delete_table_if_exists(dynamodb, table_name):
+    try:
+        table = dynamodb.Table(table_name)
+        table.delete()
+        table.wait_until_not_exists()
+    except ClientError as e:
+        if e.response['Error']['Code'] != 'ResourceNotFoundException':
+            raise
+
+class TestFaultTolerance(unittest.TestCase):
+    def setUp(self):
+        """Set up test environment."""
+        self.aws_region = 'us-east-1'
+        self.sqs = boto3.client('sqs', region_name=self.aws_region)
+        self.dynamodb = boto3.resource('dynamodb', region_name=self.aws_region)
+        self.s3 = boto3.client('s3', region_name=self.aws_region)
+        
+        # Create test queues
+        self.crawl_task_queue = self.sqs.create_queue(QueueName='crawl-task-queue')
+        self.crawl_result_queue = self.sqs.create_queue(QueueName='crawl-result-queue')
+        self.index_task_queue = self.sqs.create_queue(QueueName='index-task-queue')
+        self.index_result_queue = self.sqs.create_queue(QueueName='index-result-queue')
+        
+        # Delete and recreate test tables
+        delete_table_if_exists(self.dynamodb, 'url-frontier')
+        self.url_frontier = self.dynamodb.create_table(
+            TableName='url-frontier',
+            KeySchema=[{'AttributeName': 'url', 'KeyType': 'HASH'}],
+            AttributeDefinitions=[{'AttributeName': 'url', 'AttributeType': 'S'}],
+            ProvisionedThroughput={'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
         )
         
-        if 'Item' in response:
-            status = response['Item'].get('status')
-            print(f"Crawler status in DynamoDB: {status}")
-            if status == 'failed':
-                print("✓ Master successfully detected crawler failure")
-            else:
-                print(f"✗ Master did not mark crawler as failed (status: {status})")
-        else:
-            print("✗ Crawler entry not found in DynamoDB")
-    except Exception as e:
-        print(f"Error checking crawler status: {e}")
-    
-    # Clean up processes
-    kill_process(master_process)
-    kill_process(crawler2_process)
-    
-    print("Crawler fault tolerance test completed")
+        self.crawler_status = self.dynamodb.create_table(
+            TableName='crawler-status',
+            KeySchema=[{'AttributeName': 'crawler_id', 'KeyType': 'HASH'}],
+            AttributeDefinitions=[{'AttributeName': 'crawler_id', 'AttributeType': 'S'}],
+            ProvisionedThroughput={'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
+        )
+        
+        # Create test bucket
+        self.s3.create_bucket(Bucket='crawl-results')
+        
+        # Initialize nodes
+        self.master = MasterNode()
+        self.crawler = CrawlerNode()
+        self.indexer = WhooshIndex()
 
-def test_indexer_fault_tolerance():
-    """Test indexer node fault tolerance."""
-    print("\n=== Testing Indexer Node Fault Tolerance ===")
-    
-    # Start master node
-    master_process = start_process("python src\\master\\master_node.py")
-    time.sleep(5)  # Give master time to initialize
-    
-    # Start crawler node
-    crawler_process = start_process("python src\\crawler\\crawler_node.py")
-    time.sleep(5)  # Give crawler time to initialize
-    
-    # Start indexer node
-    indexer_process = start_process("python src\\indexer\\indexer_node.py")
-    time.sleep(5)  # Give indexer time to initialize
-    
-    # Submit a URL for crawling
-    submit_process = start_process("python src\\client\\submit_url.py https://example.com")
-    time.sleep(20)  # Give time for crawling and indexing to start
-    
-    # Kill the indexer node to simulate failure
-    print("Simulating indexer node failure...")
-    kill_process(indexer_process)
-    time.sleep(5)
-    
-    # Start a new indexer node
-    print("Starting new indexer node...")
-    new_indexer_process = start_process("python src\\indexer\\indexer_node.py")
-    time.sleep(30)  # Give time for the new indexer to recover
-    
-    # Check if the new indexer loaded the index from S3
-    # This would require checking the logs or adding specific test hooks
-    
-    # Clean up processes
-    kill_process(master_process)
-    kill_process(crawler_process)
-    kill_process(new_indexer_process)
-    
-    print("Indexer fault tolerance test completed")
+    def test_crawler_node_failure(self):
+        """Test crawler node failure and recovery."""
+        # Start crawler node
+        crawler_thread = threading.Thread(target=self.crawler.run)
+        crawler_thread.start()
+        
+        # Simulate crawler failure
+        time.sleep(2)
+        self.crawler.stop()
+        
+        # Verify crawler is marked as inactive
+        time.sleep(2)
+        response = self.dynamodb.Table('crawler-status').get_item(
+            Key={'crawler_id': self.crawler.crawler_id}
+        )
+        self.assertEqual(response['Item']['status'], 'inactive')
+        
+        # Restart crawler
+        self.crawler = CrawlerNode()
+        crawler_thread = threading.Thread(target=self.crawler.run)
+        crawler_thread.start()
+        
+        # Verify crawler is marked as active
+        time.sleep(2)
+        response = self.dynamodb.Table('crawler-status').get_item(
+            Key={'crawler_id': self.crawler.crawler_id}
+        )
+        self.assertEqual(response['Item']['status'], 'active')
 
-def test_master_fault_tolerance():
-    """Test master node fault tolerance."""
-    print("\n=== Testing Master Node Fault Tolerance ===")
-    
-    # Start master node
-    master_process = start_process("python src\\master\\master_node.py")
-    time.sleep(5)  # Give master time to initialize
-    
-    # Start crawler node
-    crawler_process = start_process("python src\\crawler\\crawler_node.py")
-    time.sleep(5)  # Give crawler time to initialize
-    
-    # Submit a URL for crawling
-    submit_process = start_process("python src\\client\\submit_url.py https://example.com")
-    time.sleep(15)  # Give time for crawling to start
-    
-    # Kill the master node to simulate failure
-    print("Simulating master node failure...")
-    kill_process(master_process)
-    time.sleep(5)
-    
-    # Start a new master node
-    print("Starting new master node...")
-    new_master_process = start_process("python src\\master\\master_node.py")
-    time.sleep(30)  # Give time for the new master to recover
-    
-    # Check if crawling continues
-    # This would require checking the logs or adding specific test hooks
-    
-    # Clean up processes
-    kill_process(new_master_process)
-    kill_process(crawler_process)
-    
-    print("Master fault tolerance test completed")
+    def test_task_timeout_handling(self):
+        """Test task timeout handling."""
+        # Add a task that will timeout
+        self.sqs.send_message(
+            QueueUrl=self.crawl_task_queue['QueueUrl'],
+            MessageBody='{"url": "http://slow-site.com", "depth": 1}'
+        )
+        
+        # Start crawler with short timeout
+        self.crawler.task_timeout = 2
+        crawler_thread = threading.Thread(target=self.crawler.run)
+        crawler_thread.start()
+        
+        # Wait for timeout
+        time.sleep(3)
+        
+        # Verify task is marked as failed
+        response = self.dynamodb.Table('url-frontier').get_item(
+            Key={'url': 'http://slow-site.com'}
+        )
+        self.assertEqual(response['Item']['status'], 'failed')
+        self.assertEqual(response['Item']['error'], 'timeout')
 
-def main():
-    """Run all fault tolerance tests."""
-    print("=== FAULT TOLERANCE TESTS ===")
-    
-    test_crawler_fault_tolerance()
-    test_indexer_fault_tolerance()
-    test_master_fault_tolerance()
-    
-    print("\nAll fault tolerance tests completed.")
+    def test_network_failure_recovery(self):
+        """Test recovery from network failures."""
+        # Simulate network failure
+        with patch('boto3.client') as mock_client:
+            mock_client.side_effect = Exception('Network error')
+            
+            # Attempt to process task
+            self.crawler._process_task({'url': 'http://test.com'})
+            
+            # Verify error is handled
+            self.assertIn('Network error', self.crawler.failed_tasks['http://test.com']['error'])
 
-if __name__ == "__main__":
-    main()
+    def test_disk_space_recovery(self):
+        """Test recovery from disk space issues."""
+        # Simulate low disk space
+        with patch('psutil.disk_usage') as mock_disk:
+            mock_disk.return_value = type('obj', (object,), {
+                'percent': 95,
+                'free': 1000000
+            })
+            
+            # Attempt to process task
+            self.crawler._process_task({'url': 'http://test.com'})
+            
+            # Verify error is handled
+            self.assertIn('disk space', self.crawler.failed_tasks['http://test.com']['error'])
+
+    def test_memory_usage_recovery(self):
+        """Test recovery from high memory usage."""
+        # Simulate high memory usage
+        with patch('psutil.virtual_memory') as mock_memory:
+            mock_memory.return_value = type('obj', (object,), {
+                'percent': 95,
+                'available': 1000000
+            })
+            
+            # Attempt to process task
+            self.crawler._process_task({'url': 'http://test.com'})
+            
+            # Verify error is handled
+            self.assertIn('memory', self.crawler.failed_tasks['http://test.com']['error'])
+
+    def test_concurrent_failures(self):
+        """Test handling of multiple concurrent failures."""
+        # Start multiple crawler nodes
+        crawlers = []
+        for _ in range(3):
+            crawler = CrawlerNode()
+            crawlers.append(crawler)
+            threading.Thread(target=crawler.run).start()
+        
+        # Simulate various failures
+        time.sleep(2)
+        crawlers[0].stop()  # Node failure
+        crawlers[1]._process_task({'url': 'http://timeout.com'})  # Timeout
+        crawlers[2]._process_task({'url': 'http://error.com'})  # Error
+        
+        # Verify all failures are handled
+        time.sleep(2)
+        for crawler in crawlers:
+            response = self.dynamodb.Table('crawler-status').get_item(
+                Key={'crawler_id': crawler.crawler_id}
+            )
+            self.assertIn(response['Item']['status'], ['active', 'inactive', 'error'])
+
+    def tearDown(self):
+        """Clean up test environment."""
+        # Delete test queues
+        self.sqs.delete_queue(QueueUrl=self.crawl_task_queue['QueueUrl'])
+        self.sqs.delete_queue(QueueUrl=self.crawl_result_queue['QueueUrl'])
+        self.sqs.delete_queue(QueueUrl=self.index_task_queue['QueueUrl'])
+        self.sqs.delete_queue(QueueUrl=self.index_result_queue['QueueUrl'])
+        
+        # Delete test tables
+        self.url_frontier.delete()
+        self.crawler_status.delete()
+        
+        # Delete test bucket
+        self.s3.delete_bucket(Bucket='crawl-results')
+
+if __name__ == '__main__':
+    unittest.main() 
